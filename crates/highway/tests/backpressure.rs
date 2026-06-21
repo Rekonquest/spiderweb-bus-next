@@ -93,10 +93,8 @@ impl Strand for Seismograph {
     fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
         for (sock, vib) in bus.recv_all::<Vibration>()? {
             if sock == SYS_VIBRATION {
-                match vib {
-                    Vibration::Backpressure { .. } => {
-                        self.felt.fetch_add(1, Ordering::SeqCst);
-                    }
+                if let Vibration::Backpressure { .. } = vib {
+                    self.felt.fetch_add(1, Ordering::SeqCst);
                 }
             }
         }

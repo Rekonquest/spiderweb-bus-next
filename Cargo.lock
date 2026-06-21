@@ -178,6 +178,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "preload"
+version = "0.1.0"
+dependencies = [
+ "highway",
+ "spider",
+ "spiderweb",
+]
+
+[[package]]
 name = "pxfm"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"

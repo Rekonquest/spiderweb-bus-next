@@ -73,6 +73,13 @@ const DEMOS: &[Demo] = &[
         description: "v1.3: threads form as messages flow; intersections emerge where they cross; a MergeAll hop fuses threads downstream.",
         estimated_duration: Duration::from_secs(5),
     },
+    Demo {
+        name: "preload",
+        package: "preload",
+        example: "preload",
+        description: "v1.3: read ahead so the next data is ready before it's asked for; parallel read-ahead keeps a starved highway's lanes full (~3x).",
+        estimated_duration: Duration::from_secs(4),
+    },
 ];
 
 fn main() {

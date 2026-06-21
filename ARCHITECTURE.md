@@ -279,6 +279,46 @@ double-delivery fix is preserved). Read it with `Bus::fabric_snapshot()`;
 the spider feels `ThreadFormed` / `IntersectionEmerged` over
 `sys.lifecycle`. Reserved `sys.*` sockets are never threaded.
 
+### Preloading — the fabric working ahead of time (v1.3)
+
+Read-ahead: the source-side dual of the highway. The `preload` crate
+(depends on `spiderweb`, std-only) prefetches data *before it is asked
+for*, like a CPU pipeline prefetching from cache.
+
+```rust
+pub struct Preloader<T> { /* background fetch threads + bounded ready-buffer */ }
+
+impl<T> Preloader<T> {
+    pub fn new<F: FnMut(u64) -> Option<T>>(depth: usize, fetch: F) -> Self;          // one fetcher, FIFO
+    pub fn with_workers<F>(depth: usize, workers: usize, make: impl Fn(usize)->F) -> Self; // parallel, unordered
+    pub fn take(&self) -> Option<T>;        // O(1) — the fetch already ran
+    pub fn ready_len(&self) -> usize;       // occupancy gauge
+}
+```
+
+- **Bounded read-ahead.** A `sync_channel(depth)` ready-buffer: a fetcher
+  blocks once `depth` items are banked, so memory is bounded and the
+  fetch paces itself to demand — no busy-spin, no unbounded growth.
+- **`PreloadStrand<T>`** is a source strand. Its tick is O(1) — drain
+  ready items and publish; the fetch happens on background threads, so
+  the tick never blocks. It detaches when the source is exhausted and
+  emits **`Vibration::Starved`** (the dual of the highway's
+  `Backpressure`) when the buffer runs dry, so the web feels a
+  source-too-slow rate mismatch the same way it feels a consumer-too-slow
+  one.
+
+**What it honestly buys.** With one worker thread per strand, adjacent
+stages already overlap and the per-strand inbox is itself a buffer — so
+single-thread read-ahead does **not** raise steady-state throughput
+(bounded by the slowest stage). Its real value in isolation is jitter
+absorption (clipping the *max* inter-arrival gap). On the bus, the
+dramatic win is **parallel read-ahead feeding the parallel layer**: a
+slow per-item fetch starves a K-lane highway, but
+`Preloader::with_workers(K)` raises the source rate to keep all K lanes
+full (~3× in the `preload` demo). Read-ahead alone can't beat a single
+slow fetch; parallel fetch can — and the two layers compose purely by
+type: `PreloadStrand → HighwayStrand → sink`.
+
 ### webctl (the CLI)
 
 `webctl` is a launcher CLI for the demos. It compiles a release binary that

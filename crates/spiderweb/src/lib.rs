@@ -138,6 +138,15 @@ pub enum Vibration {
         in_flight: usize,
         capacity: usize,
     },
+    /// A node is starving: its read-ahead buffer is running dry, so its
+    /// source/fetch can't keep up with downstream demand. The dual of
+    /// [`Vibration::Backpressure`] — same socket, opposite end of a rate
+    /// mismatch. v1.3.
+    Starved {
+        node: String,
+        ready: usize,
+        depth: usize,
+    },
 }
 
 // -----------------------------------------------------------------------------

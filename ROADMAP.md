@@ -195,10 +195,42 @@ issues, all fixed:
 - New tests for HopTo (both arms), 3-way intersection growth, and the
   reserved-recv causality fix. 38 tests green.
 
+### Preloading: the fabric working ahead of time (done)
+
+A read-ahead layer — the source-side dual of the highway. The `preload`
+crate (depends on `spiderweb`, std-only) mirrors the highway's
+two-piece shape:
+
+- `Preloader<T>` — background fetch threads run an expensive/jittery
+  `fetch(i) -> Option<T>` ahead of demand into a bounded
+  `sync_channel(depth)` ready-buffer, so the next item is materialized
+  before it's asked for. `new` = one fetch thread (FIFO); `with_workers`
+  = parallel fetch (completion order). `take`/`take_ready`/`ready_len`;
+  `Drop` stops + joins every fetcher (no leaks, even under a blocked send).
+- `PreloadStrand<T>` — a source strand: each tick drains up to `burst`
+  ready items and publishes them (O(1) tick, never blocks on fetch),
+  detaches on exhaustion, and emits `Vibration::Starved` (the source-side
+  dual of backpressure) when the buffer runs dry. The spider feels it.
+
+**Honest about the benefit.** With one worker thread per strand, adjacent
+stages already overlap and the per-strand inbox is itself an unbounded
+buffer — so single-thread read-ahead can't raise steady-state throughput
+(the `jitter_is_absorbed` unit test proves its real value — clipping the
+*max* inter-arrival gap — on the `Preloader` in isolation). The dramatic,
+honest win on the bus is **parallel read-ahead feeding the parallel
+layer**: a 40ms-per-item fetch starves a 4-lane highway, but
+`with_workers(4)` keeps all lanes full — the `preload` demo measures
+~3× (723ms → 252ms). Read-ahead alone can't beat a single slow fetch;
+parallel fetch can.
+
+- New `Vibration::Starved { node, ready, depth }` (kernel signal
+  vocabulary, like `Backpressure`); the spider logs it.
+- 10 tests (ordering, bounded buffer, zero-wait handoff, jitter
+  absorption, parallel completeness, drop-joins-under-block, starvation
+  vibration, exhaustion-detach, zero-depth/zero-worker panics).
+
 ### Still to build for v1.3
 
-- **Preloading** — prefetch the next node's input while the current
-  lane computes.
 - **Per-message precise fan-in** is opt-in (`recv_tagged` /
   `publish_tagged`); the default fan-in attribution is last-recv'd
   (honest, recorded as an intersection). A future ergonomic
@@ -237,6 +269,7 @@ Run via `webctl run <name>` or `cargo run -p <pkg> --example <name>`.
 | `highway` | highway | On-ramp a batch to the parallel layer, process across lanes, off-ramp results; ~5–6× faster than serial |
 | `congestion` | highway | Burst overruns a small highway; it emits backpressure vibrations the spider feels, and drops nothing |
 | `weave` | highway | Threads form as messages flow; intersections emerge where they cross; a MergeAll hop fuses threads downstream |
+| `preload` | preload | Read ahead so the next data is ready before it's asked for; parallel read-ahead keeps a starved highway full (~3×) |
 
 ## Tests
 

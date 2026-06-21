@@ -144,6 +144,11 @@ impl Strand for Spider {
                         "🌊 backpressure from {node}: {queued} queued ({in_flight}/{capacity} in flight)"
                     ));
                 }
+                Vibration::Starved { node, ready, depth } => {
+                    bus.log(&format!(
+                        "💨 starvation at {node}: read-ahead buffer dry ({ready}/{depth} ready)"
+                    ));
+                }
             }
         }
 
