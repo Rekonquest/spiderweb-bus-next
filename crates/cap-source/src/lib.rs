@@ -54,3 +54,9 @@ impl Strand for CapSource {
         Ok(())
     }
 }
+
+// This crate advertises itself to the bus. A binary that calls
+// `bus.auto_connect()` gets this strand with no manual registration.
+spiderweb_registry::advertise!("cap-source", || {
+    Box::new(CapSource::new()) as Box<dyn spiderweb::Strand>
+});

@@ -56,3 +56,10 @@ impl Strand for CapSink {
         Ok(())
     }
 }
+
+// This crate advertises itself to the bus. It subscribes to `String`, so
+// it auto-connects to any advertised String publisher (e.g. cap-source)
+// by type alone — no wiring.
+spiderweb_registry::advertise!("cap-sink", || {
+    Box::new(CapSink::new()) as Box<dyn spiderweb::Strand>
+});

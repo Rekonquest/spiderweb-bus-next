@@ -229,6 +229,32 @@ parallel fetch can.
   absorption, parallel completeness, drop-joins-under-block, starvation
   vibration, exhaustion-detach, zero-depth/zero-worker panics).
 
+### Self-registration: crates advertise themselves (done)
+
+The "plug-and-play" half of the doctrine. New `spiderweb-registry`
+companion crate (depends on `spiderweb` + `inventory`; the kernel stays
+std-only and dependency-free — `inventory` is quarantined here):
+
+- `advertise!("name", || Box::new(MyStrand::new()) as Box<dyn Strand>)`
+  — one line at module scope in a strand's crate; `advertise_spider!`
+  for the orchestrator.
+- `Bus::auto_connect()` — collects every advert (an `inventory`
+  distributed-slice) and calls the existing `register_spec` /
+  `register_spider`. The kernel is untouched (zero changes); auto-connect
+  and manual `register` coexist.
+- `auto_connect` demo: `main()` registers nothing; `cap-source` and
+  `cap-sink` advertise themselves and connect by type (both speak
+  `String`); the spider auto-registers and logs them online.
+- Doctrine fit: the advert is a self-advertisement (capability), the
+  registry is plumbing, the spider orchestrates the advertised set over
+  the unchanged `sys.lifecycle` stream.
+- **Honest caveat (documented loudly):** still a Cargo dependency + a
+  `use crate as _;` link anchor per strand — not disk discovery; true
+  no-recompile drop-in needs dlopen (v2). `auto_connect` prints the
+  collected count + names so a missing advert is obvious.
+- 2 tests (collected-set, auto-connect-runs); all 51 prior tests
+  unchanged.
+
 ### Still to build for v1.3
 
 - **Per-message precise fan-in** is opt-in (`recv_tagged` /
@@ -270,6 +296,7 @@ Run via `webctl run <name>` or `cargo run -p <pkg> --example <name>`.
 | `congestion` | highway | Burst overruns a small highway; it emits backpressure vibrations the spider feels, and drops nothing |
 | `weave` | highway | Threads form as messages flow; intersections emerge where they cross; a MergeAll hop fuses threads downstream |
 | `preload` | preload | Read ahead so the next data is ready before it's asked for; parallel read-ahead keeps a starved highway full (~3×) |
+| `auto-connect` | cap-source | Strands advertise themselves; `main()` registers nothing — `bus.auto_connect()` wires them, connecting by type |
 
 ## Tests
 

@@ -319,6 +319,47 @@ full (~3× in the `preload` demo). Read-ahead alone can't beat a single
 slow fetch; parallel fetch can — and the two layers compose purely by
 type: `PreloadStrand → HighwayStrand → sink`.
 
+### Self-registration — crates advertise themselves (v1.3)
+
+Connection between crates is already automatic: a strand declares the
+*types* it consumes/produces and the kernel routes by `TypeId` — no
+wires. The last manual step was *announcing* a strand (`bus.register(...)`
+in `main()`). The `spiderweb-registry` companion crate removes it.
+
+A strand crate advertises itself with one line, at module scope:
+
+```rust
+spiderweb_registry::advertise!("cap-source", || Box::new(CapSource::new()) as Box<dyn Strand>);
+```
+
+and the binary collects every advert at boot:
+
+```rust
+let mut bus = Bus::open();
+bus.auto_connect();   // registers everything advertised; main() has no list
+```
+
+Under the hood it's a distributed-slice (`inventory`): `advertise!`
+deposits a `StrandAdvert { name, factory, role }` into a static slice;
+`auto_connect` walks the slice and calls the existing `register_spec` /
+`register_spider`. **This maps onto the control doctrine exactly:** the
+advert *is* a self-advertisement (a capability — name + factory, and the
+in/out sockets surface over the unchanged `sys.lifecycle` stream); the
+registry is **plumbing**; the **spider** orchestrates the advertised set.
+
+**Kernel purity is preserved.** `inventory` (and its linker-section
+machinery) is quarantined in `spiderweb-registry` — the kernel crate
+gains *zero* dependencies and stays `forbid(unsafe_code)`. Auto-connect
+and manual `register` coexist; nothing existing changes.
+
+**Honest caveat.** This is not drop-a-file-on-disk discovery. The binary
+must still list each strand crate as a Cargo **dependency** and keep it
+linked (a `use crate as _;` anchor), because the linker can dead-strip an
+advert from a crate it otherwise never references — `auto_connect` prints
+the collected count + names so a missing one is obvious. True
+no-recompile drop-in needs dynamic loading (dlopen), a v2 step that would
+cross the std-only / unsafe line.
+
 ### webctl (the CLI)
 
 `webctl` is a launcher CLI for the demos. It compiles a release binary that

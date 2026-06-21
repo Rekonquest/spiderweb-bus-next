@@ -80,6 +80,13 @@ const DEMOS: &[Demo] = &[
         description: "v1.3: read ahead so the next data is ready before it's asked for; parallel read-ahead keeps a starved highway's lanes full (~3x).",
         estimated_duration: Duration::from_secs(4),
     },
+    Demo {
+        name: "auto-connect",
+        package: "cap-source",
+        example: "auto_connect",
+        description: "v1.3: strands advertise themselves; main() registers nothing — bus.auto_connect() wires them, connecting by type.",
+        estimated_duration: Duration::from_secs(3),
+    },
 ];
 
 fn main() {

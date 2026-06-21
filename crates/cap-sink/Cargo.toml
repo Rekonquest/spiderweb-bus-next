@@ -8,3 +8,4 @@ description = "A trivial subscriber strand for the spiderweb prototype."
 
 [dependencies]
 spiderweb = { workspace = true }
+spiderweb-registry = { workspace = true }
