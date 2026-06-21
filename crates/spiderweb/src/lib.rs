@@ -1668,25 +1668,35 @@ impl Bus {
                     Ok(WorkerExit::Crashed(_reason)) => {
                         // The kernel is plumbing: it never decides restart
                         // policy. The worker already published the
-                        // `Crashed` lifecycle event; here we only mark the
-                        // slot dead and wait for the orchestrator's
-                        // `ControlMsg` (Restart/Quarantine) on
-                        // `sys.control`. The slot stays in the map so its
-                        // factory is available for the spider's Restart.
+                        // `Crashed` lifecycle event. Restart lives ENTIRELY
+                        // in the spider — the kernel never auto-restarts.
+                        // (v1.2 had a 3-retry-then-quarantine fallback baked
+                        // in here; removed in v1.3 so the kernel stays a
+                        // dumb primitive and all crash policy is the
+                        // spider's.)
                         //
-                        // Restart policy lives ENTIRELY in the spider.
-                        // With no spider registered, a crashed strand
-                        // simply stays dead — the kernel does NOT
-                        // auto-restart it. (v1.2 had a 3-retry-then-
-                        // quarantine fallback baked into the kernel;
-                        // removed in v1.3 so the kernel stays a dumb
-                        // primitive and all crash policy is the spider's.)
+                        // The one thing the kernel still owns is its own
+                        // run-loop termination accounting (`done_count`):
+                        // it must know whether this crash is terminal. A
+                        // crashed strand can be revived only by a spider
+                        // sending `Restart` — so if a spider is registered,
+                        // park the slot (its `done_rx` was taken above, so
+                        // it's skipped every later tick) and wait for the
+                        // spider's `ControlMsg`. The slot stays in the map
+                        // so its factory is available for that Restart.
                         //
-                        // Mechanically: `done_rx` was taken above and is
-                        // not put back, so this slot is parked — skipped
-                        // on every later tick — until the spider's Restart
-                        // replaces it or Quarantine removes it. Nothing to
-                        // do here; the kernel just waits.
+                        // With NO spider, nothing can ever revive it, so
+                        // the crash is final: drop the slot and count it
+                        // done, so a spiderless `Bus::run()` still winds
+                        // down when its strands die instead of hanging
+                        // forever. This is accounting, not policy — the
+                        // kernel still restarts nothing on its own.
+                        let has_spider =
+                            kernel.spider_name.lock().unwrap().is_some();
+                        if !has_spider {
+                            kernel.slots.lock().unwrap().remove(name);
+                            done_count += 1;
+                        }
                     }
                     Err(_) => {
                         *slot.done_rx.lock().unwrap() = Some(done_rx);

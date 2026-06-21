@@ -127,6 +127,46 @@ fn no_spider_means_no_auto_restart() {
     );
 }
 
+/// `Bus::run()` is run-forever (`run_until(None)`): it returns only when
+/// every strand is terminally done. A crashed strand with no spider to
+/// revive it IS terminal, so `run()` must wind down rather than hang. The
+/// kernel counts the no-spider crash toward shutdown; without that
+/// accounting this would loop forever. We run it on a worker thread and
+/// require completion within a generous window so a regression surfaces
+/// as a failed assertion, not a hung test suite.
+#[test]
+fn run_winds_down_without_spider_after_crash() {
+    use std::sync::mpsc;
+
+    let ticks = Arc::new(AtomicU32::new(0));
+    let ticks_factory = ticks.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+
+    let worker = std::thread::spawn(move || {
+        let mut bus = Bus::open();
+        bus.register_spec(StrandSpec::new("always-crash", move || {
+            Box::new(AlwaysCrash {
+                ticks: ticks_factory.clone(),
+            })
+        }));
+        // No spider, and run-forever: the only way out is terminal
+        // accounting of the crash.
+        bus.run();
+        let _ = done_tx.send(());
+    });
+
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Bus::run() should wind down after the lone strand crashes (no spider)");
+    worker.join().unwrap();
+
+    assert_eq!(
+        ticks.load(Ordering::SeqCst),
+        1,
+        "the strand should crash exactly once before the web winds down"
+    );
+}
+
 struct LiveCrasher { count: Arc<AtomicU32> }
 
 impl Strand for LiveCrasher {
