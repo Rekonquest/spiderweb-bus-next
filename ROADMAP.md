@@ -170,6 +170,31 @@ audit of the deliver/subscribe carrier, and the exactly-once invariant
 holds under the widened tuple (the `burst_at_startup` regression still
 passes).
 
+### Review hardening (done)
+
+A multi-agent adversarial review of the fabric change surfaced 13
+issues, all fixed:
+
+- **Fan-out forking.** A thread delivered to several distinct nodes
+  used to be linearized into one fabricated chain `[S, A, B]` with
+  scheduler-dependent order. Now each extra Stay-fan-out branch forks a
+  sibling thread sharing the prefix, so every thread stays a true linear
+  desire path. (`fan_out_branches_into_sibling_threads`)
+- **Reserved sockets never touch causality.** `current_cause` now skips
+  `sys.*` carriers when seeding/refining, so feeling a vibration or
+  lifecycle event can't sever a strand's work thread.
+- **No orphan threads.** A parentless message at a `HopTo`/`MergeAll`
+  node no longer mints a dead-end thread or fires a misleading
+  `ThreadFormed`; `Fabric::outbound` returns the real born thread.
+- **MergeAll roots its fused thread at the real node** (not a synthetic
+  `node⊗` label); **HopTo to an unminted id** falls back to ordinary
+  threading instead of fabricating a ghost.
+- **Bounded fabric.** Retention is capped (`Fabric::THREAD_CAP = 1024`,
+  oldest evicted and scrubbed from the indices), mirroring
+  `PENDING_BUFFER_CAP`. (`fabric_is_bounded_under_a_flood`)
+- New tests for HopTo (both arms), 3-way intersection growth, and the
+  reserved-recv causality fix. 38 tests green.
+
 ### Still to build for v1.3
 
 - **Preloading** — prefetch the next node's input while the current
@@ -178,9 +203,8 @@ passes).
   `publish_tagged`); the default fan-in attribution is last-recv'd
   (honest, recorded as an intersection). A future ergonomic
   `publish_continuing(parent)` could make precision a one-liner.
-- **Fabric growth is unbounded** (threads/node_threads accrete like the
-  pre-bound pending buffer once did); a cap/TTL or prune-on-sink is a
-  follow-up, mirroring `PENDING_BUFFER_CAP`.
+- **Late fan-out subscribers** replay the base thread (they continue it
+  rather than forking) — a documented edge of the bounded replay buffer.
 
 ## What's next (v2, not now)
 

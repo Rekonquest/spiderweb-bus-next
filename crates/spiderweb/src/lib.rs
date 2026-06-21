@@ -234,9 +234,20 @@ struct Fabric {
     /// Lazily-minted fused thread per MergeAll node.
     merged: HashMap<NodeId, ThreadId>,
     next_thread: ThreadId,
+    /// Eviction cursor: the next thread id to consider evicting. Ids
+    /// are monotonic, so the oldest live thread is the lowest id at or
+    /// above this cursor.
+    evict_cursor: ThreadId,
 }
 
 impl Fabric {
+    /// Max threads retained. Like [`Kernel::PENDING_BUFFER_CAP`], this
+    /// bounds memory on a long-lived bus: the fabric is an
+    /// observational window over recent lineages, not an unbounded log.
+    /// Beyond this, the oldest threads are evicted and scrubbed from the
+    /// node/intersection indices.
+    const THREAD_CAP: usize = 1024;
+
     /// Mint a fresh thread born at `origin`. Returns its id.
     fn mint(&mut self, origin: &str) -> ThreadId {
         let id = self.next_thread;
@@ -248,7 +259,49 @@ impl Fabric {
                 direction: vec![origin.to_string()],
             },
         );
+        self.evict_if_needed();
         id
+    }
+
+    /// Fork a child thread off `parent` at a fan-out point: the child
+    /// inherits the parent's path so far, then diverges down its own
+    /// branch. This keeps each thread a true linear desire path — a
+    /// fan-out becomes sibling threads sharing a prefix, not one
+    /// fabricated chain through parallel nodes. Returns the child id, or
+    /// `None` if the parent is unknown (e.g. already evicted).
+    fn fork(&mut self, parent: ThreadId) -> Option<ThreadId> {
+        let prefix = self.threads.get(&parent)?.direction.clone();
+        let id = self.next_thread;
+        self.next_thread += 1;
+        self.threads.insert(id, Thread { id, direction: prefix });
+        self.evict_if_needed();
+        Some(id)
+    }
+
+    /// Evict the oldest threads while over [`Self::THREAD_CAP`],
+    /// scrubbing each evicted id from the node and intersection indices
+    /// so they never reference a dead thread.
+    fn evict_if_needed(&mut self) {
+        while self.threads.len() > Self::THREAD_CAP {
+            while self.evict_cursor < self.next_thread
+                && !self.threads.contains_key(&self.evict_cursor)
+            {
+                self.evict_cursor += 1;
+            }
+            if self.evict_cursor >= self.next_thread {
+                break;
+            }
+            let oldest = self.evict_cursor;
+            self.evict_cursor += 1;
+            self.threads.remove(&oldest);
+            for set in self.node_threads.values_mut() {
+                set.remove(&oldest);
+            }
+            for isx in self.intersections.values_mut() {
+                isx.threads.retain(|&t| t != oldest);
+            }
+            self.merged.retain(|_, v| *v != oldest);
+        }
     }
 
     /// Record that thread `tid` was delivered to `node`. Grows the
@@ -291,28 +344,73 @@ impl Fabric {
         events
     }
 
-    /// The tag a message should carry as it LEAVES `node`, applying any
-    /// configured transfer policy to the base (continued) tag.
-    fn outbound_tag(&mut self, node: &str, base: Tag) -> Tag {
-        match self.transfers.get(node).copied() {
-            None | Some(TransferPolicy::Stay) => base,
-            Some(TransferPolicy::HopTo(target)) => Some(target),
-            Some(TransferPolicy::MergeAll) => {
-                let next = self.next_thread;
-                let id = *self.merged.entry(node.to_string()).or_insert(next);
-                if id == next {
-                    self.next_thread += 1;
-                    self.threads.insert(
-                        id,
-                        Thread {
-                            id,
-                            direction: vec![format!("{node}\u{2297}")],
-                        },
-                    );
+    /// The tag a message leaves `node` with, given the tag it arrived
+    /// with (`None` = parentless). Applies the node's transfer policy.
+    /// Returns `(out_tag, newly_minted_origin)` — the second element is
+    /// `Some` only when a brand-new *origin* thread was born here (so
+    /// the caller emits `ThreadFormed` for the right thread, never an
+    /// orphan). A parentless message only mints when the policy keeps
+    /// it (`Stay`, or `HopTo` to an unknown target); under `HopTo` to a
+    /// live thread or `MergeAll` the policy's own thread is used and
+    /// nothing is orphaned.
+    fn outbound(&mut self, node: &str, incoming: Tag) -> (Tag, Option<ThreadId>) {
+        let policy = self.transfers.get(node).copied().unwrap_or_default();
+        match policy {
+            TransferPolicy::Stay => self.continue_or_mint(node, incoming),
+            TransferPolicy::HopTo(target) => {
+                if self.threads.contains_key(&target) {
+                    (Some(target), None)
+                } else {
+                    // Hop target was never minted — don't fabricate a
+                    // dangling lineage; fall back to ordinary threading.
+                    self.continue_or_mint(node, incoming)
                 }
-                Some(id)
+            }
+            TransferPolicy::MergeAll => (Some(self.merged_thread(node)), None),
+        }
+    }
+
+    /// Continue an existing thread, or mint a fresh origin for a
+    /// parentless message.
+    fn continue_or_mint(&mut self, node: &str, incoming: Tag) -> (Tag, Option<ThreadId>) {
+        match incoming {
+            Some(_) => (incoming, None),
+            None => {
+                let id = self.mint(node);
+                (Some(id), Some(id))
             }
         }
+    }
+
+    /// The fused thread for a `MergeAll` node, minted on first use and
+    /// rooted at the real node (not a synthetic label).
+    fn merged_thread(&mut self, node: &str) -> ThreadId {
+        if let Some(id) = self.merged.get(node) {
+            if self.threads.contains_key(id) {
+                return *id;
+            }
+        }
+        let id = self.next_thread;
+        self.next_thread += 1;
+        self.threads.insert(
+            id,
+            Thread {
+                id,
+                direction: vec![node.to_string()],
+            },
+        );
+        self.merged.insert(node.to_string(), id);
+        self.evict_if_needed();
+        id
+    }
+
+    /// Whether `node` has the default (`Stay`) transfer policy, so a
+    /// fan-out from it should fork sibling threads rather than fuse.
+    fn is_stay(&self, node: &str) -> bool {
+        matches!(
+            self.transfers.get(node).copied().unwrap_or_default(),
+            TransferPolicy::Stay
+        )
     }
 
     fn set_transfer(&mut self, node: &str, policy: TransferPolicy) {
@@ -491,13 +589,15 @@ pub struct BusHandle {
 
 impl BusHandle {
     fn new(strand_name: String, inbox: Vec<Carrier>, kernel: Arc<Kernel>) -> Self {
-        // Seed the cause from the inbox (first inbound tag), so a strand
-        // that publishes before recv-ing still continues the inbound
-        // thread. recv/recv_all refine this to the last item consumed.
-        let current_cause = match inbox.first() {
-            Some((_, tag, _)) => *tag,
-            None => None,
-        };
+        // Seed the cause from the first NON-reserved inbox tag, so a
+        // strand that publishes before recv-ing still continues the
+        // inbound work thread. Reserved sys.* carriers (which arrive
+        // untagged anyway) must never seed the cause — they are not
+        // threaded. recv/recv_all refine this to the last item consumed.
+        let current_cause = inbox
+            .iter()
+            .find(|(sock, _, _)| !is_reserved(sock))
+            .and_then(|(_, tag, _)| *tag);
         BusHandle {
             strand_name,
             outbox: Vec::new(),
@@ -556,7 +656,11 @@ impl BusHandle {
                 match env.downcast::<T>() {
                     Ok(v) => {
                         out.push(*v);
-                        last_tag = Some(tag);
+                        // Reserved sockets are never threaded, so they
+                        // must not refine the work cause.
+                        if !is_reserved(socket) {
+                            last_tag = Some(tag);
+                        }
                     }
                     Err(_) => unreachable!("type id verified above"),
                 }
@@ -580,7 +684,9 @@ impl BusHandle {
                 match env.downcast::<T>() {
                     Ok(v) => {
                         out.push((sock, *v));
-                        last_tag = Some(tag);
+                        if !is_reserved(sock) {
+                            last_tag = Some(tag);
+                        }
                     }
                     Err(_) => unreachable!("type id matched"),
                 }
@@ -610,7 +716,9 @@ impl BusHandle {
                 match env.downcast::<T>() {
                     Ok(v) => {
                         out.push((sock, tag, *v));
-                        last_tag = Some(tag);
+                        if !is_reserved(sock) {
+                            last_tag = Some(tag);
+                        }
                     }
                     Err(_) => unreachable!("type id matched"),
                 }
@@ -957,26 +1065,26 @@ impl Kernel {
 
         // Decide the tag this message LEAVES `from_name` with. Reserved
         // sys.* sockets are never threaded (pass through). For real
-        // work: a None tag means this node is emitting a parentless
-        // message, so mint a fresh thread rooted here; a Some tag
-        // continues its thread. Then apply the node's transfer policy
-        // (default Stay = no-op). The fabric is a leaf lock taken (and
-        // released) BEFORE the subscribers/pending critical section, so
-        // it never nests with them.
-        let mut formed: Option<ThreadId> = None;
-        let out_tag: Tag = if is_reserved(socket) {
-            tag
+        // work, `Fabric::outbound` continues the thread (or mints a
+        // fresh origin for a parentless message) and applies the node's
+        // transfer policy, returning any newly-born origin thread so we
+        // emit `ThreadFormed` for the right one. The fabric is a leaf
+        // lock taken (and released) BEFORE the subscribers/pending
+        // critical section, so it never nests with them.
+        let reserved = is_reserved(socket);
+        let (out_tag, formed): (Tag, Option<ThreadId>) = if reserved {
+            (tag, None)
         } else {
-            let mut fabric = self.fabric.lock().unwrap();
-            let base = match tag {
-                Some(_) => tag,
-                None => {
-                    let id = fabric.mint(from_name);
-                    formed = Some(id);
-                    Some(id)
-                }
-            };
-            fabric.outbound_tag(from_name, base)
+            self.fabric.lock().unwrap().outbound(from_name, tag)
+        };
+        // A fan-out from a default (Stay) node branches the lineage:
+        // each extra subscriber gets its own forked sibling thread, so
+        // every thread stays a true linear path instead of one
+        // fabricated chain through parallel nodes.
+        let forking = !reserved && out_tag.is_some() && {
+            // Cheap pre-check; the real per-branch forks happen below
+            // once we know how many distinct subscribers there are.
+            self.fabric.lock().unwrap().is_stay(from_name)
         };
 
         // Critical section: append to the buffer and snapshot the
@@ -1004,11 +1112,35 @@ impl Kernel {
             (snapshot, was_empty)
         };
 
+        // Compute the tag each subscriber receives. The first keeps the
+        // base thread; under a Stay fan-out, each additional distinct
+        // subscriber forks a sibling thread so the lineage is a tree,
+        // not a false chain. The replay buffer keeps the base tag (a
+        // late fan-out subscriber continues the base — a documented
+        // edge), so forking only changes the live sends.
+        let sub_tags: Vec<Tag> = if forking && snapshot.len() > 1 {
+            let parent = out_tag.expect("forking implies out_tag is Some");
+            let mut fabric = self.fabric.lock().unwrap();
+            snapshot
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    if i == 0 {
+                        out_tag
+                    } else {
+                        fabric.fork(parent).map(Some).unwrap_or(out_tag)
+                    }
+                })
+                .collect()
+        } else {
+            vec![out_tag; snapshot.len()]
+        };
+
         // Send to the snapshot outside the locks. Each subscriber gets
-        // its own clone, all carrying `out_tag`.
-        for sub in &snapshot {
+        // its own clone carrying its (possibly forked) tag.
+        for (sub, sub_tag) in snapshot.iter().zip(sub_tags) {
             let cloned = registry().as_ref().unwrap().clone_env(&env);
-            if let Err(returned) = sub.try_send(socket, out_tag, cloned) {
+            if let Err(returned) = sub.try_send(socket, sub_tag, cloned) {
                 eprintln!(
                     "[{:>5}ms] [kernel] ⚠️  {} disconnected mid-deliver",
                     self.boot.elapsed().as_millis(),
@@ -1274,6 +1406,12 @@ impl Bus {
         self.run_until(None)
     }
 
+    /// Run the bus until `max_duration` elapses (or forever if `None`),
+    /// or until all strands finish, Ctrl-C, or `ControlMsg::Shutdown`.
+    ///
+    /// Takes `&mut self` (not `self`) so the fabric can be inspected
+    /// with [`Bus::fabric_snapshot`] after the run returns — the binding
+    /// must therefore be `mut`. (v1.3 changed this from by-value `self`.)
     pub fn run_until(&mut self, max_duration: Option<Duration>) {
         let kernel = self.kernel.clone();
         let mut specs = std::mem::take(&mut self.specs);
@@ -2352,14 +2490,417 @@ mod tests {
                 );
             }
         }
+        // The fused thread is rooted at the real merge node `N` and is
+        // the one that carries work onward to the sink.
         let fused_reaches_sink = snap.threads.iter().any(|t| {
-            t.direction.iter().any(|n| n.contains('\u{2297}'))
+            t.direction.first().map(String::as_str) == Some("N")
                 && t.direction.iter().any(|n| n == "sink")
         });
         assert!(
             fused_reaches_sink,
-            "a fused merge thread should carry work to the sink, threads: {:?}",
+            "a fused merge thread rooted at N should carry work to the sink, threads: {:?}",
             snap.threads
+        );
+    }
+
+    /// Fan-out branches the lineage: one source feeding two distinct
+    /// sinks produces two sibling threads sharing the [source] prefix —
+    /// NOT one fabricated chain [source, sink-A, sink-B]. Guards the
+    /// fan-out forking fix.
+    #[test]
+    fn fan_out_branches_into_sibling_threads() {
+        #[derive(Clone)]
+        struct S;
+        register_clone_type::<S>();
+
+        struct Src {
+            sent: bool,
+        }
+        impl Strand for Src {
+            fn name(&self) -> &str {
+                "source"
+            }
+            fn inputs(&self) -> &[Socket] {
+                &[]
+            }
+            fn outputs(&self) -> &[Socket] {
+                const SK: Socket = Socket::new::<S>("s");
+                std::slice::from_ref(&SK)
+            }
+            fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+                if !self.sent {
+                    bus.publish("s", S)?;
+                    self.sent = true;
+                }
+                bus.sleep(Duration::from_millis(10));
+                Ok(())
+            }
+        }
+        struct Snk {
+            tag: &'static str,
+        }
+        impl Strand for Snk {
+            fn name(&self) -> &str {
+                self.tag
+            }
+            fn inputs(&self) -> &[Socket] {
+                const SK: Socket = Socket::new::<S>("s");
+                std::slice::from_ref(&SK)
+            }
+            fn outputs(&self) -> &[Socket] {
+                &[]
+            }
+            fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+                let _ = bus.recv_all::<S>()?;
+                bus.sleep(Duration::from_millis(10));
+                Ok(())
+            }
+        }
+
+        let mut bus = Bus::open();
+        bus.register(Snk { tag: "sink-A" });
+        bus.register(Snk { tag: "sink-B" });
+        bus.register(Src { sent: false });
+        bus.run_until(Some(Duration::from_millis(300)));
+
+        let snap = bus.fabric_snapshot();
+        // No thread may list both sinks — they received in parallel, so
+        // they are siblings, never a chain.
+        for t in &snap.threads {
+            let has_a = t.direction.iter().any(|n| n == "sink-A");
+            let has_b = t.direction.iter().any(|n| n == "sink-B");
+            assert!(
+                !(has_a && has_b),
+                "fan-out siblings must not be on one thread: {:?}",
+                t.direction
+            );
+        }
+        // Exactly two branches, one per sink, both rooted at source.
+        let reaches = |sink: &str| {
+            snap.threads.iter().any(|t| {
+                t.direction.first().map(String::as_str) == Some("source")
+                    && t.direction.last().map(String::as_str) == Some(sink)
+            })
+        };
+        assert!(reaches("sink-A"), "a branch should reach sink-A: {:?}", snap.threads);
+        assert!(reaches("sink-B"), "a branch should reach sink-B: {:?}", snap.threads);
+    }
+
+    /// HopTo a live thread routes onto it; HopTo an unminted id falls
+    /// back to ordinary threading and never fabricates a ghost.
+    #[test]
+    fn transfer_policy_hopto_handles_known_and_unknown_targets() {
+        #[derive(Clone)]
+        struct A;
+        #[derive(Clone)]
+        struct B;
+
+        fn run_with(target: ThreadId) -> FabricSnapshot {
+            register_clone_type::<A>();
+            register_clone_type::<B>();
+            struct Src {
+                sent: bool,
+            }
+            impl Strand for Src {
+                fn name(&self) -> &str {
+                    "S"
+                }
+                fn inputs(&self) -> &[Socket] {
+                    &[]
+                }
+                fn outputs(&self) -> &[Socket] {
+                    const SK: Socket = Socket::new::<A>("a");
+                    std::slice::from_ref(&SK)
+                }
+                fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+                    if !self.sent {
+                        bus.publish("a", A)?;
+                        self.sent = true;
+                    }
+                    bus.sleep(Duration::from_millis(10));
+                    Ok(())
+                }
+            }
+            struct M;
+            impl Strand for M {
+                fn name(&self) -> &str {
+                    "M"
+                }
+                fn inputs(&self) -> &[Socket] {
+                    const SK: Socket = Socket::new::<A>("a");
+                    std::slice::from_ref(&SK)
+                }
+                fn outputs(&self) -> &[Socket] {
+                    const SK: Socket = Socket::new::<B>("b");
+                    std::slice::from_ref(&SK)
+                }
+                fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+                    for _ in bus.recv_all::<A>()? {
+                        bus.publish("b", B)?;
+                    }
+                    bus.sleep(Duration::from_millis(10));
+                    Ok(())
+                }
+            }
+            struct Snk;
+            impl Strand for Snk {
+                fn name(&self) -> &str {
+                    "sink"
+                }
+                fn inputs(&self) -> &[Socket] {
+                    const SK: Socket = Socket::new::<B>("b");
+                    std::slice::from_ref(&SK)
+                }
+                fn outputs(&self) -> &[Socket] {
+                    &[]
+                }
+                fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+                    let _ = bus.recv_all::<B>()?;
+                    bus.sleep(Duration::from_millis(10));
+                    Ok(())
+                }
+            }
+            let mut bus = Bus::open();
+            bus.set_transfer("M", TransferPolicy::HopTo(target));
+            bus.register(Snk);
+            bus.register(M);
+            bus.register(Src { sent: false });
+            bus.run_until(Some(Duration::from_millis(300)));
+            bus.fabric_snapshot()
+        }
+
+        // Known target: the single source mints thread 0 first, M hops
+        // onto it (valid arm) — the thread reaches the sink, no ghost.
+        let known = run_with(0);
+        assert_eq!(known.threads.len(), 1, "only thread 0, no ghosts: {:?}", known.threads);
+        assert!(
+            known.threads[0].direction.iter().any(|n| n == "sink"),
+            "hopped thread should reach the sink: {:?}",
+            known.threads
+        );
+
+        // Unknown target: M falls back to continuing the inbound thread;
+        // no thread with the bogus id is ever created.
+        let unknown = run_with(999_999);
+        assert!(
+            unknown.thread(999_999).is_none(),
+            "HopTo to an unminted id must not fabricate a ghost thread"
+        );
+        assert!(
+            unknown.threads.iter().any(|t| t.direction.iter().any(|n| n == "sink")),
+            "fallback should still carry work to the sink: {:?}",
+            unknown.threads
+        );
+    }
+
+    /// An intersection keeps growing as more threads cross: three
+    /// sources into one joiner bind all three.
+    #[test]
+    fn intersection_grows_past_two_threads() {
+        #[derive(Clone)]
+        struct X;
+        register_clone_type::<X>();
+        struct Src {
+            name: &'static str,
+            sent: bool,
+        }
+        impl Strand for Src {
+            fn name(&self) -> &str {
+                self.name
+            }
+            fn inputs(&self) -> &[Socket] {
+                &[]
+            }
+            fn outputs(&self) -> &[Socket] {
+                const SK: Socket = Socket::new::<X>("x");
+                std::slice::from_ref(&SK)
+            }
+            fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+                if !self.sent {
+                    bus.publish("x", X)?;
+                    self.sent = true;
+                }
+                bus.sleep(Duration::from_millis(10));
+                Ok(())
+            }
+        }
+        struct Join;
+        impl Strand for Join {
+            fn name(&self) -> &str {
+                "joiner"
+            }
+            fn inputs(&self) -> &[Socket] {
+                const SK: Socket = Socket::new::<X>("x");
+                std::slice::from_ref(&SK)
+            }
+            fn outputs(&self) -> &[Socket] {
+                &[]
+            }
+            fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+                let _ = bus.recv_all::<X>()?;
+                bus.sleep(Duration::from_millis(10));
+                Ok(())
+            }
+        }
+        let mut bus = Bus::open();
+        bus.register(Join);
+        bus.register(Src { name: "s1", sent: false });
+        bus.register(Src { name: "s2", sent: false });
+        bus.register(Src { name: "s3", sent: false });
+        bus.run_until(Some(Duration::from_millis(400)));
+
+        let snap = bus.fabric_snapshot();
+        let isx = snap.intersection("joiner").expect("intersection at joiner");
+        assert_eq!(isx.threads.len(), 3, "all three threads should bind: {:?}", isx.threads);
+    }
+
+    /// Consuming a reserved sys.* message must NOT sever a strand's work
+    /// thread: a strand that feels the web (sys.lifecycle) and emits work
+    /// still continues its inbound thread. Guards the reserved-socket
+    /// causality fix.
+    #[test]
+    fn reserved_recv_does_not_sever_work_thread() {
+        #[derive(Clone)]
+        struct Work;
+        #[derive(Clone)]
+        struct Done;
+        register_clone_type::<Work>();
+        register_clone_type::<Done>();
+
+        struct Src {
+            sent: bool,
+        }
+        impl Strand for Src {
+            fn name(&self) -> &str {
+                "S"
+            }
+            fn inputs(&self) -> &[Socket] {
+                &[]
+            }
+            fn outputs(&self) -> &[Socket] {
+                const SK: Socket = Socket::new::<Work>("work");
+                std::slice::from_ref(&SK)
+            }
+            fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+                if !self.sent {
+                    bus.publish("work", Work)?;
+                    self.sent = true;
+                }
+                bus.sleep(Duration::from_millis(10));
+                Ok(())
+            }
+        }
+        // Subscribes to BOTH a work socket and sys.lifecycle; recvs the
+        // reserved socket LAST before publishing — which, before the fix,
+        // would reset current_cause to None and mint a fresh thread.
+        struct Watcher;
+        impl Strand for Watcher {
+            fn name(&self) -> &str {
+                "W"
+            }
+            fn inputs(&self) -> &[Socket] {
+                const SKS: [Socket; 2] = [
+                    Socket::new::<Work>("work"),
+                    Socket::new::<LifecycleEvent>(SYS_LIFECYCLE),
+                ];
+                &SKS
+            }
+            fn outputs(&self) -> &[Socket] {
+                const SK: Socket = Socket::new::<Done>("done");
+                std::slice::from_ref(&SK)
+            }
+            fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+                let work = bus.recv_all::<Work>()?;
+                let _ = bus.recv_all::<LifecycleEvent>()?; // reserved, recv'd last
+                for _ in work {
+                    bus.publish("done", Done)?;
+                }
+                bus.sleep(Duration::from_millis(10));
+                Ok(())
+            }
+        }
+        struct Snk;
+        impl Strand for Snk {
+            fn name(&self) -> &str {
+                "sink"
+            }
+            fn inputs(&self) -> &[Socket] {
+                const SK: Socket = Socket::new::<Done>("done");
+                std::slice::from_ref(&SK)
+            }
+            fn outputs(&self) -> &[Socket] {
+                &[]
+            }
+            fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+                let _ = bus.recv_all::<Done>()?;
+                bus.sleep(Duration::from_millis(10));
+                Ok(())
+            }
+        }
+
+        let mut bus = Bus::open();
+        bus.register(Snk);
+        bus.register(Watcher);
+        bus.register(Src { sent: false });
+        bus.run_until(Some(Duration::from_millis(400)));
+
+        let snap = bus.fabric_snapshot();
+        // The work thread born at S must continue unbroken through W to
+        // the sink — one thread spanning all three nodes.
+        assert!(
+            snap.threads.iter().any(|t| {
+                t.direction.first().map(String::as_str) == Some("S")
+                    && t.direction.iter().any(|n| n == "sink")
+            }),
+            "the work thread must survive a reserved recv: {:?}",
+            snap.threads
+        );
+    }
+
+    /// The fabric is bounded: a flood of parentless messages mints many
+    /// threads, but retention is capped (oldest evicted), so it never
+    /// grows without limit.
+    #[test]
+    fn fabric_is_bounded_under_a_flood() {
+        #[derive(Clone)]
+        struct P;
+        register_clone_type::<P>();
+        struct Flood {
+            sent: bool,
+        }
+        impl Strand for Flood {
+            fn name(&self) -> &str {
+                "flood"
+            }
+            fn inputs(&self) -> &[Socket] {
+                &[]
+            }
+            fn outputs(&self) -> &[Socket] {
+                const SK: Socket = Socket::new::<P>("p");
+                std::slice::from_ref(&SK)
+            }
+            fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+                if !self.sent {
+                    for _ in 0..1200 {
+                        bus.publish("p", P)?; // each parentless => its own thread
+                    }
+                    self.sent = true;
+                    return Err(StrandError::Detach);
+                }
+                Ok(())
+            }
+        }
+        let mut bus = Bus::open();
+        bus.register(Flood { sent: false });
+        bus.run_until(Some(Duration::from_millis(300)));
+
+        // 1200 parentless publishes mint 1200 threads, but the fabric
+        // caps retention at 1024 (FABRIC_THREAD_CAP), evicting oldest.
+        let snap = bus.fabric_snapshot();
+        assert!(
+            snap.threads.len() <= 1024,
+            "fabric must stay bounded, got {} threads",
+            snap.threads.len()
         );
     }
 
