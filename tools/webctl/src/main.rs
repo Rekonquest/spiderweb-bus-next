@@ -87,6 +87,13 @@ const DEMOS: &[Demo] = &[
         description: "v1.3: strands advertise themselves; main() registers nothing — bus.auto_connect() wires them, connecting by type.",
         estimated_duration: Duration::from_secs(3),
     },
+    Demo {
+        name: "spatial-weave",
+        package: "spiderweb-viz",
+        example: "spatial_weave",
+        description: "v1.3: the web in 3D — ground/highway/spider at z=0/1/2; a vibration felt strongly near, faintly far; exports a 3D scene.",
+        estimated_duration: Duration::from_secs(3),
+    },
 ];
 
 fn main() {

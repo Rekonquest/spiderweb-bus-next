@@ -258,6 +258,32 @@ std-only and dependency-free — `inventory` is quarantined here):
   two-spiders-panic, and a cross-crate linker test. All 51 prior tests
   unchanged.
 
+### 3D spatial awareness (done — slice 1)
+
+A geometric overlay on the fabric. `Position { x, y, z }` (kernel,
+std f64) + `attenuation(origin, receiver)` (the physics
+spreading-activation primitive: `1/(1+d)`, a dumb pure function).
+
+- Nodes advertise a position (`advertise_at!`) or are placed via
+  `Bus::place`; the kernel `Fabric` records it; `FabricSnapshot` gains
+  `positions` + `position()` + `distance()`.
+- The Z-axis makes elevation literal (ground 0, highway 1, spider 2).
+- Vibrations attenuate with distance — receiver-side (resolve origin via
+  `snapshot.position(node)`), so the `Vibration` enum and `Strand` trait
+  are untouched (additive; all 56 prior tests pass).
+- New std-only `spiderweb-viz` crate: `scene_json(&FabricSnapshot)`
+  exports a 3D scene (kernel stays dependency-free).
+- `spatial_weave` demo: ground/highway/spider at z=0/1/2; the highway's
+  backpressure felt ~10× harder near (0.5) than far (0.048); scene
+  exported. Honest: coordinates + distance + attenuation only — no
+  latency claim (in-process distance is a logical overlay; physical with
+  edge transport).
+- Doctrine fit (composition technique): `attenuation` is a dumb harvested
+  primitive; the spider orchestrates the reaction. 6 new tests.
+- Sequenced next: kernel-stamped vibration origin if needed; an
+  interactive 3D viewer; distance/cost-aware routing (v2, gated on edge
+  transport — honest only when distance means real latency).
+
 ### Still to build for v1.3
 
 - **Per-message precise fan-in** is opt-in (`recv_tagged` /
@@ -300,6 +326,7 @@ Run via `webctl run <name>` or `cargo run -p <pkg> --example <name>`.
 | `weave` | highway | Threads form as messages flow; intersections emerge where they cross; a MergeAll hop fuses threads downstream |
 | `preload` | preload | Read ahead so the next data is ready before it's asked for; parallel read-ahead keeps a starved highway full (~3×) |
 | `auto-connect` | cap-source | Strands advertise themselves; `main()` registers nothing — `bus.auto_connect()` wires them, connecting by type |
+| `spatial-weave` | spiderweb-viz | The web in 3D — ground/highway/spider at z=0/1/2; a vibration felt strongly near, faintly far; exports a 3D scene |
 
 ## Tests
 

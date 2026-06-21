@@ -1,0 +1,15 @@
+[package]
+name = "spiderweb-viz"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Export a spiderweb FabricSnapshot as a 3D scene (std-only JSON) for visualization."
+
+[dependencies]
+spiderweb.workspace = true
+
+[dev-dependencies]
+highway.workspace = true
+spider.workspace = true
+spiderweb-registry.workspace = true

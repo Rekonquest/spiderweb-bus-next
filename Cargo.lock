@@ -239,5 +239,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "spiderweb-viz"
+version = "0.1.0"
+dependencies = [
+ "highway",
+ "spider",
+ "spiderweb",
+ "spiderweb-registry",
+]
+
+[[package]]
 name = "webctl"
 version = "0.1.0"

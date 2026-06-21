@@ -207,6 +207,76 @@ pub enum TransferPolicy {
     MergeAll,
 }
 
+/// A node's position in the web's 3D space (v1.3). A *logical* overlay:
+/// in a single-process bus every node is in the same RAM, so distance is
+/// a number you compute — for visualization, organization, and policy —
+/// not a latency you feel. (It gains physical meaning with edge transport
+/// in v2, where a position maps to a real machine/GPU.) The Z-axis
+/// encodes the layer/elevation metaphor: ground ~ z=0, highway ~ z=1,
+/// orchestration ~ z=2.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Position {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+impl Position {
+    pub const ORIGIN: Position = Position { x: 0.0, y: 0.0, z: 0.0 };
+
+    pub const fn new(x: f64, y: f64, z: f64) -> Self {
+        Position { x, y, z }
+    }
+
+    /// Euclidean distance to another position.
+    pub fn distance(&self, other: Position) -> f64 {
+        let dx = self.x - other.x;
+        let dy = self.y - other.y;
+        let dz = self.z - other.z;
+        (dx * dx + dy * dy + dz * dz).sqrt()
+    }
+}
+
+/// How strongly a vibration emitted at `origin` is felt by a node at
+/// `receiver` — a scalar in `(0, 1]`. A real spiderweb transmits a touch
+/// that decays with distance: `1 / (1 + d)` (finite at `d = 0`,
+/// monotonically decreasing). If either position is unknown the vibration
+/// is felt at full strength (`1.0`) — an unplaced node feels everything.
+///
+/// This is the physics *spreading-activation / decay-with-distance*
+/// primitive: a dumb pure function. It computes felt-strength; it makes
+/// no decision. The orchestrator (the spider, or any receiver) reads it
+/// and decides how to react — mechanism here, policy there. The decay
+/// kernel ([`attenuation`] = `1/(1+d)`, [`attenuation_within`] = radius
+/// cutoff) is a swappable generator in one primitive slot.
+pub fn attenuation(origin: Option<Position>, receiver: Option<Position>) -> f64 {
+    match (origin, receiver) {
+        (Some(o), Some(r)) => 1.0 / (1.0 + o.distance(r)),
+        _ => 1.0,
+    }
+}
+
+/// Like [`attenuation`] but with a hard `radius` cutoff: a vibration is
+/// felt nothing (`0.0`) strictly beyond `radius` from its origin — the
+/// edge of the web's reach.
+pub fn attenuation_within(
+    origin: Option<Position>,
+    receiver: Option<Position>,
+    radius: f64,
+) -> f64 {
+    match (origin, receiver) {
+        (Some(o), Some(r)) => {
+            let d = o.distance(r);
+            if d > radius {
+                0.0
+            } else {
+                1.0 / (1.0 + d)
+            }
+        }
+        _ => 1.0,
+    }
+}
+
 /// A read-only snapshot of the fabric for tests, demos, and tooling.
 /// The fabric itself lives in the kernel and accretes from traffic;
 /// this is a cloned view that holds no locks.
@@ -214,6 +284,9 @@ pub enum TransferPolicy {
 pub struct FabricSnapshot {
     pub threads: Vec<Thread>,
     pub intersections: Vec<Intersection>,
+    /// Node positions in the web's 3D space (v1.3). Only placed nodes
+    /// appear; an unplaced node is simply absent.
+    pub positions: Vec<(NodeId, Position)>,
 }
 
 impl FabricSnapshot {
@@ -225,6 +298,20 @@ impl FabricSnapshot {
     /// The intersection at this node, if one has emerged.
     pub fn intersection(&self, node: &str) -> Option<&Intersection> {
         self.intersections.iter().find(|i| i.node == node)
+    }
+
+    /// This node's position, if it has been placed.
+    pub fn position(&self, node: &str) -> Option<Position> {
+        self.positions
+            .iter()
+            .find(|(n, _)| n == node)
+            .map(|(_, p)| *p)
+    }
+
+    /// Euclidean distance between two placed nodes (`None` if either is
+    /// unplaced).
+    pub fn distance(&self, a: &str, b: &str) -> Option<f64> {
+        Some(self.position(a)?.distance(self.position(b)?))
     }
 }
 
@@ -242,6 +329,9 @@ struct Fabric {
     transfers: HashMap<NodeId, TransferPolicy>,
     /// Lazily-minted fused thread per MergeAll node.
     merged: HashMap<NodeId, ThreadId>,
+    /// Node positions in the web's 3D space. Pure metadata, parallel to
+    /// the routing path; set via [`Bus::place`] or an advertised position.
+    positions: HashMap<NodeId, Position>,
     next_thread: ThreadId,
     /// Eviction cursor: the next thread id to consider evicting. Ids
     /// are monotonic, so the oldest live thread is the lowest id at or
@@ -429,10 +519,19 @@ impl Fabric {
         }
     }
 
+    fn set_position(&mut self, node: &str, pos: Position) {
+        self.positions.insert(node.to_string(), pos);
+    }
+
     fn snapshot(&self) -> FabricSnapshot {
         FabricSnapshot {
             threads: self.threads.values().cloned().collect(),
             intersections: self.intersections.values().cloned().collect(),
+            positions: self
+                .positions
+                .iter()
+                .map(|(n, p)| (n.clone(), *p))
+                .collect(),
         }
     }
 }
@@ -1409,6 +1508,15 @@ impl Bus {
     /// [`ControlMsg::SetTransfer`].
     pub fn set_transfer(&mut self, node: &str, policy: TransferPolicy) {
         self.kernel.fabric.lock().unwrap().set_transfer(node, policy);
+    }
+
+    /// Place `node` at a position in the web's 3D space. Pure metadata —
+    /// it changes no routing or timing (every node is in the same RAM);
+    /// it's read via [`Bus::fabric_snapshot`] for visualization,
+    /// organization, and spider policy (e.g. distance-attenuated
+    /// vibrations). Overrides any advertised position (operator wins).
+    pub fn place(&mut self, node: &str, pos: Position) {
+        self.kernel.fabric.lock().unwrap().set_position(node, pos);
     }
 
     pub fn run(mut self) {
@@ -2911,6 +3019,69 @@ mod tests {
             "fabric must stay bounded, got {} threads",
             snap.threads.len()
         );
+    }
+
+    // ----- 3D spatial awareness (v1.3) -----------------------------------
+
+    /// Euclidean distance is exact on a 3-4-5 triple (f64, no flake).
+    #[test]
+    fn position_distance_is_euclidean() {
+        let a = Position::new(0.0, 0.0, 0.0);
+        let b = Position::new(3.0, 4.0, 0.0);
+        assert_eq!(a.distance(b), 5.0);
+        assert_eq!(a.distance(a), 0.0);
+    }
+
+    /// An unplaced node (either end) feels a vibration at full strength.
+    #[test]
+    fn attenuation_none_is_full() {
+        let p = Position::new(1.0, 2.0, 3.0);
+        assert_eq!(attenuation(None, Some(p)), 1.0);
+        assert_eq!(attenuation(Some(p), None), 1.0);
+        assert_eq!(attenuation(None, None), 1.0);
+    }
+
+    /// Attenuation is 1.0 at d=0, strictly decreasing, always in (0,1];
+    /// the radius variant cuts to 0 strictly beyond the radius.
+    #[test]
+    fn attenuation_decays_with_distance() {
+        let o = Position::ORIGIN;
+        let near = Position::new(1.0, 0.0, 0.0); // d=1
+        let far = Position::new(9.0, 0.0, 0.0); // d=9
+        assert_eq!(attenuation(Some(o), Some(o)), 1.0);
+        let a_near = attenuation(Some(o), Some(near));
+        let a_far = attenuation(Some(o), Some(far));
+        assert!(a_near > a_far, "near felt more strongly than far");
+        assert!(a_far > 0.0 && a_near <= 1.0);
+        // radius cutoff: felt within, nothing beyond.
+        assert!(attenuation_within(Some(o), Some(near), 5.0) > 0.0);
+        assert_eq!(attenuation_within(Some(o), Some(far), 5.0), 0.0);
+    }
+
+    /// The fabric records a placed position; `place` overrides an earlier
+    /// placement (operator wins); an unplaced node is absent.
+    #[test]
+    fn fabric_records_and_overrides_position() {
+        let mut bus = Bus::open();
+        bus.place("a", Position::new(1.0, 2.0, 3.0));
+        bus.place("b", Position::new(3.0, 4.0, 0.0));
+        bus.place("a", Position::new(9.0, 9.0, 9.0)); // override
+        let snap = bus.fabric_snapshot();
+        assert_eq!(snap.position("a"), Some(Position::new(9.0, 9.0, 9.0)));
+        assert_eq!(snap.position("b"), Some(Position::new(3.0, 4.0, 0.0)));
+        assert_eq!(snap.position("unplaced"), None);
+    }
+
+    /// Snapshot distance between two placed nodes is Euclidean; unplaced
+    /// yields None.
+    #[test]
+    fn snapshot_distance_between_nodes() {
+        let mut bus = Bus::open();
+        bus.place("a", Position::new(0.0, 0.0, 0.0));
+        bus.place("b", Position::new(3.0, 4.0, 0.0));
+        let snap = bus.fabric_snapshot();
+        assert_eq!(snap.distance("a", "b"), Some(5.0));
+        assert_eq!(snap.distance("a", "ghost"), None);
     }
 
     // ----- Strand-name collision detection (H4) ---------------------------

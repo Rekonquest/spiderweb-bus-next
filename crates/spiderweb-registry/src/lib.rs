@@ -45,7 +45,7 @@
 
 #![forbid(unsafe_code)]
 
-use spiderweb::{Bus, Strand, StrandSpec};
+use spiderweb::{Bus, Position, Strand, StrandSpec};
 
 /// Re-export so the [`advertise!`] macro can reach `inventory::submit!`
 /// from any crate that depends only on `spiderweb-registry`.
@@ -67,6 +67,9 @@ pub struct StrandAdvert {
     pub name: &'static str,
     pub factory: fn() -> Box<dyn Strand>,
     pub role: Role,
+    /// Optional 3D position the node advertises (v1.3). `None` = unplaced.
+    /// `auto_connect` forwards a `Some` to `Bus::place`.
+    pub position: Option<Position>,
 }
 
 inventory::collect!(StrandAdvert);
@@ -92,6 +95,24 @@ macro_rules! advertise {
                 name: $name,
                 factory: $factory,
                 role: $crate::Role::Strand,
+                position: ::core::option::Option::None,
+            }
+        }
+    };
+}
+
+/// Advertise a strand WITH a 3D position (v1.3). `auto_connect` forwards
+/// the position to `Bus::place`, so the node appears in the geometric
+/// fabric snapshot. `pos` is a `spiderweb::Position`.
+#[macro_export]
+macro_rules! advertise_at {
+    ($name:expr, $factory:expr, $pos:expr $(,)?) => {
+        $crate::inventory::submit! {
+            $crate::StrandAdvert {
+                name: $name,
+                factory: $factory,
+                role: $crate::Role::Strand,
+                position: ::core::option::Option::Some($pos),
             }
         }
     };
@@ -108,6 +129,7 @@ macro_rules! advertise_spider {
                 name: $name,
                 factory: $factory,
                 role: $crate::Role::Spider,
+                position: ::core::option::Option::None,
             }
         }
     };
@@ -209,6 +231,11 @@ impl BusAutoConnect for Bus {
                     self.register_spider(spec);
                     spider_name = Some(adv.name);
                 }
+            }
+            // Forward an advertised position into the geometric fabric.
+            // (Bus::place may still override it afterward — operator wins.)
+            if let Some(pos) = adv.position {
+                self.place(adv.name, pos);
             }
         }
         eprintln!("{}", summary(&strand_names, spider_name));

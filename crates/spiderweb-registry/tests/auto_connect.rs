@@ -126,11 +126,13 @@ fn two_advertised_spiders_panic() {
             name: "s1",
             factory: make_spider,
             role: Role::Spider,
+            position: None,
         },
         StrandAdvert {
             name: "s2",
             factory: make_spider,
             role: Role::Spider,
+            position: None,
         },
     ];
     let mut bus = Bus::open();

@@ -363,6 +363,42 @@ turns a missing advert into a loud panic. True no-recompile drop-in needs
 dynamic loading (dlopen), a v2 step that would cross the std-only / unsafe
 line.
 
+### 3D spatial awareness (v1.3)
+
+A real spiderweb is 3D, and vibrations propagate through 3D space,
+attenuating with distance. The bus gets a geometric overlay.
+
+```rust
+pub struct Position { pub x: f64, pub y: f64, pub z: f64 }   // a node's place in the web
+pub fn attenuation(origin: Option<Position>, receiver: Option<Position>) -> f64; // 1/(1+d)
+```
+
+- **Nodes advertise a position** — through the same self-registration
+  (`advertise_at!`), or `Bus::place(name, pos)` (operator override). The
+  kernel records it in the fabric; `fabric_snapshot` exposes
+  `positions`, `position(node)`, and `distance(a, b)`.
+- **The fabric becomes geometric.** Each `Thread.direction` resolves
+  through positions into a 3D polyline; `spiderweb-viz::scene_json`
+  exports the weave as a scene a three.js/Babylon viewer can load (a
+  separate std-only crate — the kernel stays dependency-free).
+- **The Z-axis makes elevation literal:** ground ~ z=0, highway ~ z=1,
+  orchestration ~ z=2 — an on-ramp is a real coordinate delta.
+- **Vibrations attenuate with distance.** `attenuation` is the physics
+  *spreading-activation* primitive — a **dumb pure function** (it decays
+  `1/(1+d)`, makes no decision). A receiver (the spider, or any strand)
+  reads it — resolving a vibration's origin via `snapshot.position(node)`
+  since the emitter's name is already in every `Vibration` — and decides
+  how to react. Mechanism here, policy there. So the `Vibration` enum and
+  `Strand` trait are untouched.
+
+**Honest framing.** In a single-process bus every node is in the same
+RAM, so distance has **no latency** — positions are a *logical* overlay
+whose value now is visualization, organization, and spider policy (e.g.
+weighting reaction by how near congestion is). They gain physical meaning
+with edge transport (v2), where a position maps to a real machine/GPU and
+distance approximates transport/resource cost — the foundation for
+distance/cost-aware routing (the "3D fabric routing" concept).
+
 ### webctl (the CLI)
 
 `webctl` is a launcher CLI for the demos. It compiles a release binary that

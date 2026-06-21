@@ -6,6 +6,7 @@ members = [
     "crates/highway",
     "crates/preload",
     "crates/spiderweb-registry",
+    "crates/spiderweb-viz",
     "crates/cap-source",
     "crates/cap-sink",
     "crates/cap-slow-sink",
@@ -26,3 +27,4 @@ spider = { path = "crates/spider" }
 highway = { path = "crates/highway" }
 preload = { path = "crates/preload" }
 spiderweb-registry = { path = "crates/spiderweb-registry" }
+spiderweb-viz = { path = "crates/spiderweb-viz" }
