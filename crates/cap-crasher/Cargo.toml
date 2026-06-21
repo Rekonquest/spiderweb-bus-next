@@ -1,0 +1,10 @@
+[package]
+name = "cap-crasher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "A strand that crashes after a configurable number of ticks. Used to test the spider's recovery."
+
+[dependencies]
+spiderweb = { workspace = true }

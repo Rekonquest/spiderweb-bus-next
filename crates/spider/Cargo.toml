@@ -1,0 +1,10 @@
+[package]
+name = "spider"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The default orchestrator for the spiderweb bus. Watches lifecycle events and decides what to do when a strand crashes."
+
+[dependencies]
+spiderweb = { workspace = true }

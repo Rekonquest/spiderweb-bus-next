@@ -1,0 +1,158 @@
+//! `webctl` — the spiderweb bus command-line tool.
+//!
+//! For v1.2 (no network transport), this is a launcher + log tail.
+//! Future versions will support live introspection of a running web.
+//!
+//! Subcommands:
+//! - `webctl list`         — list available demos
+//! - `webctl run <name>`   — run a demo by name
+//! - `webctl topology`     — show the static topology from a demo
+//! - `webctl version`      — show the kernel version
+
+use std::process::{Command, Stdio};
+use std::time::Duration;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Debug, Clone)]
+struct Demo {
+    name: &'static str,
+    package: &'static str,
+    example: &'static str,
+    description: &'static str,
+    estimated_duration: Duration,
+}
+
+const DEMOS: &[Demo] = &[
+    Demo {
+        name: "demo",
+        package: "cap-source",
+        example: "demo",
+        description: "v1.1: one source, two sinks, no wires. Proves fan-out by type.",
+        estimated_duration: Duration::from_secs(5),
+    },
+    Demo {
+        name: "demo-v1-1",
+        package: "cap-source",
+        example: "demo_v1_1",
+        description: "v1.1: source, sinks, spider, and crashers. Proves restart + quarantine.",
+        estimated_duration: Duration::from_secs(15),
+    },
+    Demo {
+        name: "backpressure",
+        package: "cap-source",
+        example: "backpressure",
+        description: "v1.2: fast source, fast sink, slow sink. Proves fan-out under congestion.",
+        estimated_duration: Duration::from_secs(6),
+    },
+    Demo {
+        name: "image-pipeline",
+        package: "cap-image",
+        example: "pipeline",
+        description: "v1.2: load PNG, resize, save. Real bytes through the bus (base64).",
+        estimated_duration: Duration::from_secs(8),
+    },
+];
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("list");
+
+    match cmd {
+        "list" | "ls" => list_demos(),
+        "run" => {
+            let name = match args.get(2) {
+                Some(n) => n,
+                None => {
+                    eprintln!("usage: webctl run <demo-name>");
+                    eprintln!("run `webctl list` to see available demos");
+                    std::process::exit(1);
+                }
+            };
+            run_demo(name);
+        }
+        "topology" | "top" => show_topology(),
+        "version" | "--version" | "-v" => {
+            println!("webctl {}", VERSION);
+            println!("spiderweb v1.2");
+        }
+        "help" | "--help" | "-h" => {
+            print_help();
+        }
+        _ => {
+            print_help();
+        }
+    }
+}
+
+fn list_demos() {
+    println!("🕸️  spiderweb demos (v1.2):\n");
+    for (i, demo) in DEMOS.iter().enumerate() {
+        let dur = format!("{}s", demo.estimated_duration.as_secs());
+        println!(
+            "  {}. {} ({})\n     {}",
+            i + 1,
+            demo.name,
+            dur,
+            demo.description
+        );
+    }
+    println!("\nRun with: webctl run <name>");
+}
+
+fn run_demo(name: &str) {
+    let demo = match DEMOS.iter().find(|d| d.name == name) {
+        Some(d) => d,
+        None => {
+            eprintln!("unknown demo: {}", name);
+            eprintln!("run `webctl list` to see available demos");
+            std::process::exit(1);
+        }
+    };
+    println!("🕸️  running `{}` ({} seconds)\n", demo.name, demo.estimated_duration.as_secs());
+    let status = Command::new("cargo")
+        .args([
+            "run",
+            "-p",
+            demo.package,
+            "--example",
+            demo.example,
+        ])
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status();
+    match status {
+        Ok(s) if s.success() => println!("\n✓ demo `{}` exited cleanly", demo.name),
+        Ok(s) => println!("\n✗ demo `{}` exited with code {:?}", demo.name, s.code()),
+        Err(e) => eprintln!("\n✗ failed to run demo: {}", e),
+    }
+}
+
+fn show_topology() {
+    println!("🕸️  spiderweb bus topology (v1.2):\n");
+    println!("Strand types:");
+    println!("  cap-source       — publisher (String payload)");
+    println!("  cap-sink         — subscriber (String payload)");
+    println!("  cap-slow-sink    — slow subscriber (sleeps per msg)");
+    println!("  cap-crasher      — test harness (crashes on Nth tick)");
+    println!("  cap-image-*      — image processing (load/resize/save)");
+    println!("  spider           — orchestrator (subscribes to sys.lifecycle)");
+    println!();
+    println!("Reserved sockets:");
+    println!("  sys.lifecycle    — kernel → orchestrator events");
+    println!("  sys.control      — orchestrator → kernel commands (v1.3)");
+    println!();
+    println!("Run `webctl list` to see the demo topologies.");
+}
+
+fn print_help() {
+    println!("🕸️  webctl — spiderweb bus CLI (v1.2)\n");
+    println!("USAGE:");
+    println!("    webctl <command>\n");
+    println!("COMMANDS:");
+    println!("    list           List available demos");
+    println!("    run <name>     Run a demo");
+    println!("    topology       Show the static topology");
+    println!("    version        Show the version");
+    println!("    help           Show this help");
+}

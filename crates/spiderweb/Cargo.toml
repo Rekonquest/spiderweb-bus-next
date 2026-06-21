@@ -1,0 +1,15 @@
+[package]
+name = "spiderweb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "A plug-and-play bus for Rust strands. No Tokio. No async. Threads, channels, types."
+
+[dependencies]
+
+[dev-dependencies]
+spider = { path = "../spider" }
+
+[lints.rust]
+unsafe_code = "forbid"
