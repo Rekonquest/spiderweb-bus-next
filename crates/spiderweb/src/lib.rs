@@ -945,12 +945,8 @@ struct StrandSlot {
     /// via [`Bus::register_spec`].
     factory: Option<StrandFactory>,
     done_rx: Mutex<Option<Receiver<WorkerExit>>>,
-    quarantined: std::sync::atomic::AtomicBool,
     generation: std::sync::atomic::AtomicUsize,
     join: Mutex<Option<JoinHandle<()>>>,
-    /// True when the worker has exited and the slot is awaiting
-    /// the spider's decision (Restart/Quarantine) via sys.control.
-    dead: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug)]
@@ -977,12 +973,11 @@ struct Kernel {
     /// publish `ControlMsg` here to direct the kernel.
     control_rx: Mutex<Option<Receiver<Carrier>>>,
     /// Name of the registered spider (if any). Set by
-    /// [`Bus::register_spider`]. The kernel uses this to decide
-    /// whether to fall back to auto-restart on crash (no spider)
-    /// or to wait for the spider to decide (spider present).
-    /// This is explicit, not inferred from socket subscriptions,
-    /// so registering a lifecycle observer does NOT disable the
-    /// fallback path.
+    /// [`Bus::register_spider`], which enforces at most one. The kernel
+    /// does NOT use it for crash policy — restart is entirely the
+    /// spider's job (the kernel always waits for a `ControlMsg` on
+    /// crash). It is kept as the single-spider guard and for
+    /// introspection.
     spider_name: Mutex<Option<String>>,
 }
 
@@ -1030,10 +1025,8 @@ impl Kernel {
             name: name.to_string(),
             factory,
             done_rx: Mutex::new(Some(done_rx)),
-            quarantined: std::sync::atomic::AtomicBool::new(false),
             generation: std::sync::atomic::AtomicUsize::new(0),
             join: Mutex::new(None),
-            dead: std::sync::atomic::AtomicBool::new(false),
         });
 
         let first_strand = match slot.factory.as_ref() {
@@ -1085,10 +1078,8 @@ impl Kernel {
             name: name.clone(),
             factory: None,
             done_rx: Mutex::new(Some(done_rx)),
-            quarantined: std::sync::atomic::AtomicBool::new(false),
             generation: std::sync::atomic::AtomicUsize::new(0),
             join: Mutex::new(None),
-            dead: std::sync::atomic::AtomicBool::new(false),
         });
 
         for sock in strand.inputs() {
@@ -1466,12 +1457,13 @@ impl Bus {
         self.specs.push(spec);
     }
 
-    /// Register a strand spec as the orchestrator (spider). The
-    /// kernel uses this to decide crash-handling policy: when a
-    /// strand crashes and a spider is present, the kernel waits
-    /// for the spider to issue a `ControlMsg`; when no spider is
-    /// present, the kernel falls back to auto-restart (3 times,
-    /// then quarantine).
+    /// Register a strand spec as the orchestrator (spider). The spider
+    /// owns ALL crash policy: on a crash the kernel marks the slot dead
+    /// and waits for the spider to issue a `ControlMsg`
+    /// (Restart/Quarantine) on `sys.control`. With no spider registered,
+    /// a crashed strand simply stays dead — the kernel never
+    /// auto-restarts (it is a dumb primitive; policy lives in the
+    /// orchestrator).
     ///
     /// At most one spider can be registered. Calling this twice
     /// is a panic.
@@ -1631,14 +1623,7 @@ impl Bus {
                             }
                         }
                         ControlMsg::Quarantine { name, reason } => {
-                            if let Some(slot) =
-                                kernel.slots.lock().unwrap().get(name.as_str()).cloned()
-                            {
-                                slot.quarantined.store(
-                                    true,
-                                    std::sync::atomic::Ordering::SeqCst,
-                                );
-                            }
+                            // The spider gave up on this strand: drop it.
                             kernel.publish_lifecycle(LifecycleEvent::Quarantined {
                                 name: name.clone(),
                                 reason: reason.clone(),
@@ -1681,78 +1666,27 @@ impl Bus {
                         done_count += 1;
                     }
                     Ok(WorkerExit::Crashed(_reason)) => {
-                        // v1.2: the spider drives the restart policy.
-                        // It sees the Crashed lifecycle event, decides
-                        // what to do, and sends a ControlMsg. The
-                        // kernel just marks the slot as dead and
-                        // waits. The slot stays in the map (so the
-                        // factory is available for the spider's
-                        // Restart).
+                        // The kernel is plumbing: it never decides restart
+                        // policy. The worker already published the
+                        // `Crashed` lifecycle event; here we only mark the
+                        // slot dead and wait for the orchestrator's
+                        // `ControlMsg` (Restart/Quarantine) on
+                        // `sys.control`. The slot stays in the map so its
+                        // factory is available for the spider's Restart.
                         //
-                        // If NO spider is registered, fall back to
-                        // the v1.1 auto-restart policy (3 restarts,
-                        // then quarantine). v1.3 will remove the
-                        // auto-restart entirely.
+                        // Restart policy lives ENTIRELY in the spider.
+                        // With no spider registered, a crashed strand
+                        // simply stays dead — the kernel does NOT
+                        // auto-restart it. (v1.2 had a 3-retry-then-
+                        // quarantine fallback baked into the kernel;
+                        // removed in v1.3 so the kernel stays a dumb
+                        // primitive and all crash policy is the spider's.)
                         //
-                        // We check the explicit spider_name field
-                        // rather than inferring from
-                        // `LifecycleEvent` subscribers. The
-                        // `LifecycleObserver` test strand also
-                        // subscribes to `LifecycleEvent` but is
-                        // not a spider; inferring would mistake it
-                        // for one.
-                        let has_spider = kernel
-                            .spider_name
-                            .lock()
-                            .unwrap()
-                            .is_some();
-                        if !has_spider {
-                            // Fallback auto-restart for demos without
-                            // a spider.
-                            if slot.quarantined.load(std::sync::atomic::Ordering::SeqCst) {
-                                kernel.slots.lock().unwrap().remove(name);
-                                done_count += 1;
-                                continue;
-                            }
-                            // Live (non-restartable) strands can't be
-                            // auto-restarted. Just remove them.
-                            let factory_opt = slot.factory.clone();
-                            let Some(factory) = factory_opt else {
-                                kernel.slots.lock().unwrap().remove(name);
-                                done_count += 1;
-                                continue;
-                            };
-                            let count = pending_restarts.entry(name.clone()).or_insert(0);
-                            let max = 3;
-                            if *count >= max {
-                                slot.quarantined.store(
-                                    true,
-                                    std::sync::atomic::Ordering::SeqCst,
-                                );
-                                kernel.publish_lifecycle(LifecycleEvent::Quarantined {
-                                    name: name.clone(),
-                                    reason: format!("crashed {} times", max),
-                                });
-                                kernel.slots.lock().unwrap().remove(name);
-                                done_count += 1;
-                                continue;
-                            }
-                            *count += 1;
-                            let attempt = *count;
-                            let new_slot = kernel.restart_slot(name.as_str(), factory);
-                            kernel.slots.lock().unwrap().insert(name.clone(), new_slot);
-                            kernel.publish_lifecycle(LifecycleEvent::Restarted {
-                                name: name.clone(),
-                                attempt,
-                            });
-                        } else {
-                            // Spider is driving. The slot stays in
-                            // the map with `dead = true`. The done_rx
-                            // is consumed. A new install will happen
-                            // when the spider sends Restart, which
-                            // replaces this slot in the map.
-                            slot.dead.store(true, std::sync::atomic::Ordering::SeqCst);
-                        }
+                        // Mechanically: `done_rx` was taken above and is
+                        // not put back, so this slot is parked — skipped
+                        // on every later tick — until the spider's Restart
+                        // replaces it or Quarantine removes it. Nothing to
+                        // do here; the kernel just waits.
                     }
                     Err(_) => {
                         *slot.done_rx.lock().unwrap() = Some(done_rx);

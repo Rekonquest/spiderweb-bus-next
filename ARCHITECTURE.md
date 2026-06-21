@@ -129,13 +129,16 @@ publishes to `sys.control`. Its job:
 - On the 4th crash: publish `ControlMsg::Quarantine { name, reason }`.
 - Log every event for the operator.
 
-The kernel executes the spider's decisions. The spider is registered
-explicitly via `Bus::register_spider(spec)`; the kernel tracks its name in
-`kernel.spider_name` and uses that to decide whether to fall back to
-auto-restart on crash (no spider present) or to wait for the spider to
-issue a `ControlMsg`. v1.2 fallback: if no spider is registered, the
-kernel auto-restarts strands up to 3 times (v1.1 behavior). v1.3 will
-remove the fallback.
+The kernel executes the spider's decisions. **Restart policy lives
+entirely in the spider — the kernel is a dumb primitive.** On a crash the
+kernel marks the slot dead and waits for the spider's `ControlMsg`
+(Restart/Quarantine) on `sys.control`; it never decides on its own. With
+no spider registered, a crashed strand simply stays dead. (v1.2 had a
+3-retry-then-quarantine fallback baked into the kernel; **v1.3 removed
+it** so the kernel carries no crash policy — composition doctrine:
+mechanism in the primitive, policy in the orchestrator.) The spider is
+registered explicitly via `Bus::register_spider(spec)`, which enforces at
+most one.
 
 ### Highway (Layer 2, the parallel layer — v1.3)
 
@@ -419,7 +422,7 @@ introspection of a running web (requires network transport).
 | Routing | TypeId-based, fan-out to all subscribers | No wires to draw; kernel owns the topology |
 | Multi-instance | Each strand instance is its own subscriber | Free redundancy |
 | Routing policy | v1.2: fan-out to all. v2: least-loaded + heartbeat | Simple first |
-| Crash policy | v1.2: spider decides via sys.control. Kernel fallback: 3 restarts, then quarantine | Spider is the authority; kernel is the muscle. The spider is registered explicitly via `Bus::register_spider(spec)`; the kernel tracks its name in `kernel.spider_name`. |
+| Crash policy | v1.3: spider owns ALL of it via sys.control. Kernel marks the slot dead and waits — no in-kernel fallback. With no spider, a crashed strand stays dead | Spider is the authority; kernel is the muscle. Mechanism in the primitive, policy in the orchestrator (composition doctrine). The spider is registered explicitly via `Bus::register_spider(spec)`. |
 | Spawn policy | User declares at boot, kernel reacts | Auto-spawn is a footgun |
 | Strand params | None in v1.2 | ComfyUI params add a config surface; the web should be invisible |
 | Strand types | Live (no factory, non-restartable) and Factory-based (restartable) | Two registration paths; kernel marks live strands dead on crash |

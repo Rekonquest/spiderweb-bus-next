@@ -286,6 +286,28 @@ spreading-activation primitive: `1/(1+d)`, a dumb pure function).
   interactive 3D viewer; distance/cost-aware routing (v2, gated on edge
   transport — honest only when distance means real latency).
 
+### Crash policy fully in the spider (done)
+
+A composition-doctrine hardening: the kernel is a dumb primitive, so it
+must carry **no** crash policy. v1.2 left a 3-retry-then-quarantine
+fallback baked into `run_until` for the no-spider case — mechanism doing
+the orchestrator's job. v1.3 removes it.
+
+- The `Crashed` arm of `run_until` now just marks the slot dead and waits
+  for the spider's `ControlMsg` (Restart/Quarantine). No retry counter,
+  no quarantine decision in the kernel.
+- Vestigial `quarantined` / `dead` bookkeeping fields removed from
+  `StrandSlot`; the slot is simply absent once quarantined.
+- With **no spider registered, a crashed strand stays dead** — there is
+  no longer any in-kernel auto-restart. Restart is the spider's job or it
+  doesn't happen.
+- Honest fit: mechanism in the primitive, policy in the orchestrator. The
+  spider already drove restart/quarantine in v1.2; this deletes the only
+  remaining place the kernel made a policy call on its own.
+- New `no_spider_means_no_auto_restart` integration test (crashes once,
+  stays dead); `spider_restarts_then_succeeds` and
+  `spider_quarantines_after_max_crashes` still pass unchanged.
+
 ### Still to build for v1.3
 
 - **Per-message precise fan-in** is opt-in (`recv_tagged` /

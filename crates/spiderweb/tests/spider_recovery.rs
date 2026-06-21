@@ -102,6 +102,31 @@ fn spider_quarantines_after_max_crashes() {
     );
 }
 
+/// With NO spider registered, a crashed strand stays dead — the kernel
+/// never auto-restarts it. Restart policy lives entirely in the spider
+/// (the kernel is a dumb primitive; the v1.2 in-kernel fallback was
+/// removed in v1.3).
+#[test]
+fn no_spider_means_no_auto_restart() {
+    let ticks = Arc::new(AtomicU32::new(0));
+    let ticks_factory = ticks.clone();
+
+    let mut bus = Bus::open();
+    bus.register_spec(StrandSpec::new("always-crash", move || {
+        Box::new(AlwaysCrash {
+            ticks: ticks_factory.clone(),
+        })
+    }));
+    // Deliberately NO register_spider.
+    bus.run_until(Some(Duration::from_millis(400)));
+
+    assert_eq!(
+        ticks.load(Ordering::SeqCst),
+        1,
+        "with no spider, the crashed strand should run exactly once and stay dead"
+    );
+}
+
 struct LiveCrasher { count: Arc<AtomicU32> }
 
 impl Strand for LiveCrasher {
