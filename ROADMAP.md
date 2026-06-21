@@ -339,6 +339,29 @@ accounting even after every worker strand finishes — stop such a web with
 `run_until(Some(_))` or a `ControlMsg::Shutdown`. Excluding the
 orchestrator from the shutdown tally is a separate, larger change (v2).
 
+### Fabric adjacency: the strand graph as topology (done)
+
+Groundwork for a topology-aware vibration kernel. `FabricSnapshot::adjacency()`
+returns `FabricAdjacency { nodes, edges }`, reading the fabric's own edge
+index off `Thread.direction` — each consecutive node-pair is a directed
+edge; conductance = thread-*segment* traversal multiplicity (no per-edge
+byte counters exist yet, so traversal count is the honest weight, a
+drop-in swap later). Pure mechanism: kernel reports the graph, makes no
+routing/attenuation decision; stays `forbid(unsafe_code)`, std-only.
+
+- Deterministic (`nodes` sorted/deduped, `edges` sorted by `(from,to)`);
+  self-loops skipped (zero diagonal); a one-node thread is an isolated
+  vertex; edges directed (symmetrization is the consumer's policy).
+- 9 tests; an adversarial review surfaced that conductance is **inflated
+  by downstream Stay fan-out** (`Fabric::fork` copies the full prefix into
+  each sibling, so an upstream edge counts once per branch) — now
+  documented explicitly and pinned by `adjacency_conductance_counts_fan_out_branches`.
+- **Unblocks** replacing the painted Euclidean `attenuation()` (`1/(1+d)`,
+  which ignores the graph) with the **graph heat-kernel** generator
+  (`L = D − A`, propagate one column of `H_t = exp(−t·L)` by sparse
+  mat-vecs) — the cross-domain primitive harvest's #1 in-process build.
+  The heat kernel itself is the next slice; this only exposes the topology.
+
 ### Still to build for v1.3
 
 - **Per-message precise fan-in** is opt-in (`recv_tagged` /
