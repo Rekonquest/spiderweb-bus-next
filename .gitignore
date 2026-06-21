@@ -6,3 +6,6 @@
 *.swp
 .DS_Store
 Thumbs.db
+
+# Playwright MCP debug artifacts
+.playwright-mcp/
