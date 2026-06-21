@@ -142,14 +142,45 @@ same two locks in a consistent order — so every (message, subscriber)
 pair is delivered by exactly one path. Guarded by a looped
 `burst_at_startup_delivers_exactly_once` regression test.
 
+### Threads & intersections: the emergent fabric (done)
+
+The web draws itself from traffic. Every message carries a `Tag`
+(`Option<ThreadId>`) parallel to its payload — invisible to strand
+authors; `publish`/`recv` are unchanged. The kernel mints a thread when
+a parentless message enters the fabric and continues it via a per-handle
+`current_cause` stitched across the universal recv→publish idiom. The
+worker records each arrival, so a `Thread`'s `direction` grows through
+the nodes it actually traverses — a desire path, not a declared edge.
+
+- **Threads** form as messages flow: `Thread { id, direction: Vec<NodeId> }`.
+- **Intersections** emerge where a node first sees a second distinct
+  thread: `Intersection { node, threads, transfer }`.
+- **TransferPolicy** (`Stay` default = no-op, `HopTo`, `MergeAll`)
+  governs hops; set via `Bus::set_transfer` or `ControlMsg::SetTransfer`.
+- The **highway carries the tag through its lanes** (`on_ramp_tagged` /
+  `off_ramp_tagged`), so provenance survives reordering and the
+  input-tick≠output-tick gap.
+- The spider feels `ThreadFormed` / `IntersectionEmerged` over
+  `sys.lifecycle`. `Bus::fabric_snapshot()` returns a read-only view.
+- `weave` demo + 6 fabric tests (form-through-many-nodes,
+  emergence, Stay/MergeAll transfer, highway provenance, no-flow).
+
+A kernel-transparency win along the way: provenance forced a careful
+audit of the deliver/subscribe carrier, and the exactly-once invariant
+holds under the widened tuple (the `burst_at_startup` regression still
+passes).
+
 ### Still to build for v1.3
 
-- **Threads** — paths that form as messages flow (desire paths through
-  many nodes), not just a single on-ramp→off-ramp hop.
-- **Intersections** — where two threads cross at a node, with a
-  transfer policy for hopping between them.
 - **Preloading** — prefetch the next node's input while the current
   lane computes.
+- **Per-message precise fan-in** is opt-in (`recv_tagged` /
+  `publish_tagged`); the default fan-in attribution is last-recv'd
+  (honest, recorded as an intersection). A future ergonomic
+  `publish_continuing(parent)` could make precision a one-liner.
+- **Fabric growth is unbounded** (threads/node_threads accrete like the
+  pre-bound pending buffer once did); a cap/TTL or prune-on-sink is a
+  follow-up, mirroring `PENDING_BUFFER_CAP`.
 
 ## What's next (v2, not now)
 
@@ -181,6 +212,7 @@ Run via `webctl run <name>` or `cargo run -p <pkg> --example <name>`.
 | `image-pipeline` | cap-image | Real bytes (base64) through the bus; load/resize/save; observable fan-out via `-A` / `-B` suffix |
 | `highway` | highway | On-ramp a batch to the parallel layer, process across lanes, off-ramp results; ~5–6× faster than serial |
 | `congestion` | highway | Burst overruns a small highway; it emits backpressure vibrations the spider feels, and drops nothing |
+| `weave` | highway | Threads form as messages flow; intersections emerge where they cross; a MergeAll hop fuses threads downstream |
 
 ## Tests
 

@@ -48,7 +48,7 @@
 
 #![forbid(unsafe_code)]
 
-use spiderweb::{BusHandle, Socket, Strand, StrandError, Vibration, SYS_VIBRATION};
+use spiderweb::{BusHandle, Socket, Strand, StrandError, Tag, Vibration, SYS_VIBRATION};
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -107,11 +107,14 @@ type LaneFn<I, O> = Arc<dyn Fn(I) -> O + Send + Sync>;
 /// `Highway` never leaks threads.
 pub struct Highway<I, O> {
     /// The single producer end of the shared job queue. Held by the
-    /// highway; every lane shares the receiver behind a mutex.
-    job_tx: Sender<I>,
+    /// highway; every lane shares the receiver behind a mutex. Each job
+    /// carries its provenance [`Tag`] glued to the item, so the tag
+    /// survives lane reordering and the input-tick≠output-tick gap.
+    job_tx: Sender<(Tag, I)>,
     /// The single consumer end of the results channel. Lanes hold
-    /// cloned producer ends.
-    result_rx: Receiver<O>,
+    /// cloned producer ends. Results carry the same tag the job entered
+    /// with.
+    result_rx: Receiver<(Tag, O)>,
     handles: Vec<JoinHandle<()>>,
     lanes: usize,
     /// Work accepted onto the highway but not yet finished by a lane:
@@ -155,9 +158,9 @@ where
         assert!(capacity >= 1, "a highway needs capacity for at least one item");
 
         let f: LaneFn<I, O> = Arc::new(f);
-        let (job_tx, job_rx) = mpsc::channel::<I>();
+        let (job_tx, job_rx) = mpsc::channel::<(Tag, I)>();
         let job_rx = Arc::new(Mutex::new(job_rx));
-        let (result_tx, result_rx) = mpsc::channel::<O>();
+        let (result_tx, result_rx) = mpsc::channel::<(Tag, O)>();
         let in_flight = Arc::new(AtomicUsize::new(0));
 
         let mut handles = Vec::with_capacity(lanes);
@@ -188,10 +191,20 @@ where
     /// On-ramp: lift one item from the ground onto the highway. The
     /// next free lane will pick it up. Non-blocking. Counts the item
     /// as in flight; check [`Highway::has_room`] first if you want to
-    /// respect backpressure.
+    /// respect backpressure. The item travels with no thread tag — use
+    /// [`Highway::on_ramp_tagged`] to preserve provenance.
     pub fn on_ramp(&self, item: I) -> Result<(), HighwayError> {
+        self.on_ramp_tagged(None, item)
+    }
+
+    /// On-ramp carrying a provenance [`Tag`]. The tag rides through the
+    /// lanes glued to the item and comes back out the off-ramp, so a
+    /// result demoted many ticks later still names its origin thread.
+    /// Used by [`HighwayStrand`]; ordinary callers use
+    /// [`Highway::on_ramp`].
+    pub fn on_ramp_tagged(&self, tag: Tag, item: I) -> Result<(), HighwayError> {
         self.in_flight.fetch_add(1, Ordering::SeqCst);
-        match self.job_tx.send(item) {
+        match self.job_tx.send((tag, item)) {
             Ok(()) => Ok(()),
             Err(_) => {
                 // Never delivered — undo the count so the gauge stays
@@ -204,8 +217,16 @@ where
 
     /// Off-ramp: take every result a lane has finished so far, in
     /// completion order. Non-blocking — returns what is ready right
-    /// now and leaves the lanes running.
+    /// now and leaves the lanes running. Drops thread tags — use
+    /// [`Highway::off_ramp_tagged`] to keep them.
     pub fn off_ramp(&self) -> Vec<O> {
+        self.result_rx.try_iter().map(|(_tag, o)| o).collect()
+    }
+
+    /// Off-ramp keeping each result's provenance [`Tag`] (the one its
+    /// item entered the on-ramp with). Used by [`HighwayStrand`] to
+    /// re-publish results on their origin thread.
+    pub fn off_ramp_tagged(&self) -> Vec<(Tag, O)> {
         self.result_rx.try_iter().collect()
     }
 
@@ -252,8 +273,8 @@ impl<I, O> Drop for Highway<I, O> {
 /// One lane's loop: pull a job, run the transform, push the result,
 /// repeat until the on-ramp closes.
 fn run_lane<I, O>(
-    job_rx: Arc<Mutex<Receiver<I>>>,
-    result_tx: Sender<O>,
+    job_rx: Arc<Mutex<Receiver<(Tag, I)>>>,
+    result_tx: Sender<(Tag, O)>,
     f: LaneFn<I, O>,
     in_flight: Arc<AtomicUsize>,
 ) {
@@ -270,13 +291,15 @@ fn run_lane<I, O>(
         };
 
         match job {
-            Ok(item) => {
+            Ok((tag, item)) => {
+                // The transform runs on the item only; the tag rides
+                // through untouched, glued to its result.
                 let out = f(item);
                 // The item is finished: free its capacity now, before
                 // we even hand off the result. A finished result
                 // waiting in the off-ramp is no longer "in flight".
                 in_flight.fetch_sub(1, Ordering::SeqCst);
-                if result_tx.send(out).is_err() {
+                if result_tx.send((tag, out)).is_err() {
                     // The off-ramp (the `Highway`) is gone. Nothing
                     // left to do.
                     return;
@@ -315,11 +338,12 @@ pub struct HighwayStrand<I, O> {
     out_sockets: [Socket; 2],
     out_socket: &'static str,
     highway: Highway<I, O>,
-    /// Items pulled off the ground bus but not yet on-ramped, because
-    /// the highway was full. This is the strand's own holding area: it
-    /// absorbs bursts and retries each tick, so backpressure *holds*
-    /// work rather than dropping it.
-    pending: VecDeque<I>,
+    /// Items (with their provenance tags) pulled off the ground bus but
+    /// not yet on-ramped, because the highway was full. The strand's own
+    /// holding area: it absorbs bursts and retries each tick, so
+    /// backpressure *holds* work rather than dropping it — and the tag
+    /// stays glued to its item the whole way through.
+    pending: VecDeque<(Tag, I)>,
     /// Backlog depth at the last vibration we emitted. We only emit
     /// when the depth changes, so a steady backlog doesn't spam the
     /// web with identical vibrations.
@@ -425,10 +449,12 @@ where
 
     fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
         // INTAKE: pull every inbound ground message into the strand's
-        // holding area. We don't on-ramp directly — the highway may be
-        // full, and we never drop work.
-        for (_sock, item) in bus.recv_all::<I>()? {
-            self.pending.push_back(item);
+        // holding area, keeping each item's provenance tag. We don't
+        // on-ramp directly — the highway may be full, and we never drop
+        // work. Using the tagged recv so the origin thread rides through
+        // the lanes with its item.
+        for (_sock, tag, item) in bus.recv_tagged::<I>()? {
+            self.pending.push_back((tag, item));
         }
 
         // ON-RAMP: lift held work onto the highway while it has room.
@@ -436,8 +462,8 @@ where
         // `pending` for the next tick.
         while self.highway.has_room() {
             match self.pending.pop_front() {
-                Some(item) => {
-                    if self.highway.on_ramp(item).is_err() {
+                Some((tag, item)) => {
+                    if self.highway.on_ramp_tagged(tag, item).is_err() {
                         return Err(StrandError::Crashed(
                             "highway on-ramp closed (lanes gone)".into(),
                         ));
@@ -466,9 +492,12 @@ where
             self.last_queued = queued;
         }
 
-        // OFF-RAMP: demote every finished result back onto the ground.
-        for out in self.highway.off_ramp() {
-            bus.publish(self.out_socket, out)?;
+        // OFF-RAMP: demote every finished result back onto the ground,
+        // re-stamping it with the origin thread it carried through the
+        // lanes — so provenance survives the parallel layer's
+        // reordering and the input-tick≠output-tick gap.
+        for (tag, out) in self.highway.off_ramp_tagged() {
+            bus.publish_tagged(self.out_socket, tag, out)?;
         }
 
         bus.sleep(self.idle);

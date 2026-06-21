@@ -223,6 +223,62 @@ To avoid spamming the web, a strand emits a vibration only when its
 backlog depth *changes*, so a steady jam produces a clean rise-and-fall
 of signals rather than a flood.
 
+### Threads, intersections, the fabric (v1.3)
+
+The web is not a declared graph — it draws itself from traffic. As
+messages flow they trace **threads** (desire paths through many nodes);
+where two threads cross a node, an **intersection** emerges. Together
+they are the **fabric**, which is empty at boot and accretes purely from
+flow.
+
+```rust
+pub type ThreadId = u64;
+pub type Tag = Option<ThreadId>;          // rides PARALLEL to the payload
+pub struct Thread { pub id: ThreadId, pub direction: Vec<NodeId> }
+pub struct Intersection { pub node: NodeId, pub threads: Vec<ThreadId>, pub transfer: TransferPolicy }
+pub enum TransferPolicy { Stay, HopTo(ThreadId), MergeAll }   // default Stay = no-op
+```
+
+**Provenance is kernel-transparent.** The carrier tuple widened from
+`(socket, Envelope)` to `(socket, Tag, Envelope)`. The `Tag` rides
+*parallel* to the type-erased payload, never inside it, so the clone
+registry and `recv::<T>()` downcast are untouched and `publish`/`recv`
+keep identical signatures. **Ordinary strand authors never see a tag.**
+
+**Causality without inference.** The kernel can't see which input
+produced which output inside a strand's opaque `run()`. So it doesn't
+guess: each `BusHandle` carries a `current_cause`, seeded from the inbox
+and updated by `recv`/`recv_all` to the last item handed out. `publish`
+stamps that cause. Since every strand does recv-then-publish, outputs
+continue the right thread for free. A parentless `publish` (a source, or
+any publish before a `recv`) carries `None`; the kernel mints a fresh
+thread on delivery, rooted at that node.
+
+**Paths grow at arrival.** The worker records each inbound tagged
+message into the fabric as it drains its inbox, so a node lands on a
+thread's `direction` the moment a message reaches it — capturing
+replayed messages too. An intersection emerges the instant a node's
+observed-thread set goes from one to two.
+
+**The highway carries the tag through its lanes.** `on_ramp_tagged` /
+`off_ramp_tagged` glue the tag to the item, so provenance survives lane
+reordering and the input-tick≠output-tick gap — a result demoted three
+ticks late still names its origin thread. The author's `Fn(I) -> O`
+never sees the tag.
+
+**Transfer policy governs hops.** At an intersection, `Stay` (default)
+keeps threads on their identity — so enabling the fabric changes no
+routing. `HopTo`/`MergeAll` re-parent a node's outputs; set them
+explicitly via `Bus::set_transfer` or have the spider publish
+`ControlMsg::SetTransfer` — Layer-3 orchestration governing the weave
+without any strand knowing.
+
+The fabric lives in the kernel behind its own leaf mutex, mutated only
+*outside* the deliver/subscribe exactly-once critical section (so the
+double-delivery fix is preserved). Read it with `Bus::fabric_snapshot()`;
+the spider feels `ThreadFormed` / `IntersectionEmerged` over
+`sys.lifecycle`. Reserved `sys.*` sockets are never threaded.
+
 ### webctl (the CLI)
 
 `webctl` is a launcher CLI for the demos. It compiles a release binary that

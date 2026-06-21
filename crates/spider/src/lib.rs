@@ -114,6 +114,15 @@ impl Strand for Spider {
                         count, socket, to
                     ));
                 }
+                LifecycleEvent::ThreadFormed { thread, origin } => {
+                    bus.log(&format!("🧵 thread {} born at {}", thread, origin));
+                }
+                LifecycleEvent::IntersectionEmerged { node, threads } => {
+                    bus.log(&format!(
+                        "✕ intersection emerged at {} (threads {:?})",
+                        node, threads
+                    ));
+                }
             }
         }
 

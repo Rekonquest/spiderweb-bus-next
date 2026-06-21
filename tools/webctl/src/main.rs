@@ -66,6 +66,13 @@ const DEMOS: &[Demo] = &[
         description: "v1.3: burst overruns a small highway; it emits backpressure vibrations the spider feels, and drops nothing.",
         estimated_duration: Duration::from_secs(3),
     },
+    Demo {
+        name: "weave",
+        package: "highway",
+        example: "weave",
+        description: "v1.3: threads form as messages flow; intersections emerge where they cross; a MergeAll hop fuses threads downstream.",
+        estimated_duration: Duration::from_secs(5),
+    },
 ];
 
 fn main() {
