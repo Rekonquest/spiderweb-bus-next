@@ -379,8 +379,10 @@ pub fn attenuation(origin: Option<Position>, receiver: Option<Position>) -> f64;
   `positions`, `position(node)`, and `distance(a, b)`.
 - **The fabric becomes geometric.** Each `Thread.direction` resolves
   through positions into a 3D polyline; `spiderweb-viz::scene_json`
-  exports the weave as a scene a three.js/Babylon viewer can load (a
-  separate std-only crate — the kernel stays dependency-free).
+  exports the weave as a scene, and `scene_html` produces a
+  self-contained, **interactive viewer** (three.js + OrbitControls —
+  drag to rotate, scroll to zoom) with the scene embedded. A separate
+  std-only crate — the kernel stays dependency-free.
 - **The Z-axis makes elevation literal:** ground ~ z=0, highway ~ z=1,
   orchestration ~ z=2 — an on-ramp is a real coordinate delta.
 - **Vibrations attenuate with distance.** `attenuation` is the physics

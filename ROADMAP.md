@@ -272,7 +272,9 @@ spreading-activation primitive: `1/(1+d)`, a dumb pure function).
   `snapshot.position(node)`), so the `Vibration` enum and `Strand` trait
   are untouched (additive; all 56 prior tests pass).
 - New std-only `spiderweb-viz` crate: `scene_json(&FabricSnapshot)`
-  exports a 3D scene (kernel stays dependency-free).
+  exports a 3D scene, and `scene_html` produces a self-contained
+  interactive viewer (three.js + OrbitControls — drag to rotate). Kernel
+  stays dependency-free.
 - `spatial_weave` demo: ground/highway/spider at z=0/1/2; the highway's
   backpressure felt ~10× harder near (0.5) than far (0.048); scene
   exported. Honest: coordinates + distance + attenuation only — no

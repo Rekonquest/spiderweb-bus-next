@@ -31,11 +31,13 @@ struct Parcel(u64);
 struct Delivered(u64);
 
 struct Dispatcher {
+    name: &'static str,
+    base: u64,
     sent: bool,
 }
 impl Strand for Dispatcher {
     fn name(&self) -> &str {
-        "dispatcher"
+        self.name
     }
     fn inputs(&self) -> &[Socket] {
         &[]
@@ -46,8 +48,8 @@ impl Strand for Dispatcher {
     }
     fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
         if !self.sent {
-            for i in 0..24 {
-                bus.publish("road.parcel", Parcel(i))?;
+            for i in 0..12 {
+                bus.publish("road.parcel", Parcel(self.base + i))?;
             }
             self.sent = true;
         }
@@ -86,7 +88,16 @@ fn main() {
     register_clone_type::<Delivered>();
 
     let mut bus = Bus::open();
-    bus.register(Dispatcher { sent: false });
+    bus.register(Dispatcher {
+        name: "orders",
+        base: 0,
+        sent: false,
+    });
+    bus.register(Dispatcher {
+        name: "refunds",
+        base: 100,
+        sent: false,
+    });
     bus.register(HighwayStrand::<Parcel, Delivered>::with_capacity(
         "highway",
         "road.parcel",
@@ -106,10 +117,13 @@ fn main() {
     });
     bus.register_spider(StrandSpec::new("spider", || Box::new(Spider::new())));
 
-    // Place the web in 3D: ground at z=0, highway at z=1, spider at z=2.
-    bus.place("dispatcher", Position::new(0.0, 0.0, 0.0));
-    bus.place("depot", Position::new(10.0, 0.0, 0.0));
+    // Place the web in 3D: two ground sources at z=0, the highway lifted
+    // to z=1, the spider overseeing at z=2 — so the threads climb from
+    // the sources, cross at the highway, and drop to the depot.
+    bus.place("orders", Position::new(0.0, 3.0, 0.0));
+    bus.place("refunds", Position::new(0.0, -3.0, 0.0));
     bus.place("highway", Position::new(5.0, 0.0, 1.0));
+    bus.place("depot", Position::new(10.0, 0.0, 0.0));
     bus.place("spider", Position::new(5.0, 0.0, 2.0));
 
     bus.run_until(Some(Duration::from_secs(3)));
@@ -124,20 +138,20 @@ fn main() {
     let pos = |n: &str| snap.position(n).unwrap();
 
     println!("\n── the web in 3D (logical coordinates, not latency) ──");
-    println!("  dispatcher  {:?}", pos("dispatcher"));
+    println!("  orders      {:?}", pos("orders"));
     println!("  highway     {:?}", pos("highway"));
     println!("  spider      {:?}", pos("spider"));
     println!(
         "  elevation:  ground z={} < highway z={} < spider z={}  (on-ramp = a real z-delta)",
-        pos("dispatcher").z,
+        pos("orders").z,
         pos("highway").z,
         pos("spider").z
     );
-    assert!(pos("dispatcher").z < pos("highway").z && pos("highway").z < pos("spider").z);
+    assert!(pos("orders").z < pos("highway").z && pos("highway").z < pos("spider").z);
 
     println!(
-        "\n  distance(dispatcher, highway) = {:.3}",
-        snap.distance("dispatcher", "highway").unwrap()
+        "\n  distance(orders, highway) = {:.3}",
+        snap.distance("orders", "highway").unwrap()
     );
 
     // The highway emitted backpressure. How strongly is it felt near vs far?
@@ -156,9 +170,16 @@ fn main() {
     assert!(felt_near > felt_far);
 
     let scene = spiderweb_viz::scene_json(&snap);
-    let path = std::env::temp_dir().join("spiderweb-scene.json");
-    std::fs::write(&path, &scene).expect("write scene");
-    println!("\n  3D scene exported: {} ({} bytes)", path.display(), scene.len());
+    let json_path = std::env::temp_dir().join("spiderweb-scene.json");
+    std::fs::write(&json_path, &scene).expect("write scene json");
+
+    // The interactive, rotatable viewer (self-contained HTML).
+    let html = spiderweb_viz::scene_html(&snap);
+    let html_path = std::env::temp_dir().join("spiderweb-weave.html");
+    std::fs::write(&html_path, &html).expect("write viewer");
+
+    println!("\n  3D scene:   {} ({} bytes)", json_path.display(), scene.len());
+    println!("  3D viewer:  {} — open it and drag to rotate", html_path.display());
     println!(
         "\n  (coordinates + distance + attenuation only — all nodes are in RAM, timing unchanged)"
     );
