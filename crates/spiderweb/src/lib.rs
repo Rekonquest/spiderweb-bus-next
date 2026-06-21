@@ -329,6 +329,94 @@ impl FabricSnapshot {
     pub fn distance(&self, a: &str, b: &str) -> Option<f64> {
         Some(self.position(a)?.distance(self.position(b)?))
     }
+
+    /// The fabric as a weighted graph: its vertex set and its directed
+    /// edge set, read straight off the desire-paths in [`Thread::direction`].
+    ///
+    /// Each consecutive node-pair `(from, to)` along a thread is one
+    /// directed edge (`from` published, `to` received). An edge's
+    /// **conductance** is its *traversal multiplicity* — how many
+    /// thread-traversals crossed it — so a single use weighs `1.0` and a
+    /// worn desire-path weighs more. (The fabric tracks no per-edge byte
+    /// counters today, so traversal count is the honest observed-traffic
+    /// weight; a future bytes/sec or lane-bandwidth conductance is a
+    /// drop-in swap once such counters exist.) Self-loops (`from == to`)
+    /// are skipped, so the diagonal of the resulting adjacency is zero.
+    ///
+    /// This is the adjacency a graph-Laplacian / heat-kernel vibration
+    /// generator consumes: build `L = D − A` over [`FabricAdjacency::nodes`]
+    /// and propagate one column of `H_t = exp(−t·L)` by sparse mat-vecs.
+    /// The edges are **directed** (faithful to message flow); a generator
+    /// that wants a symmetric `A` folds reciprocal pairs as *it* decides
+    /// (sum / average / max) — that symmetrization is the generator's
+    /// policy, not the fabric's. Pure mechanism: the kernel reports its
+    /// own edge index and makes no routing or attenuation decision; no
+    /// positions are involved.
+    ///
+    /// Deterministic: `nodes` is sorted/deduplicated and `edges` is sorted
+    /// by `(from, to)`, mirroring [`Fabric::snapshot`]'s ordering so golden
+    /// tests stay stable. A node that appears in a one-node thread (a
+    /// lineage that never moved) is an isolated vertex — present in
+    /// `nodes`, absent from `edges`, degree `0`.
+    pub fn adjacency(&self) -> FabricAdjacency {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let mut nodes: BTreeSet<&NodeId> = BTreeSet::new();
+        let mut weights: BTreeMap<(&NodeId, &NodeId), f64> = BTreeMap::new();
+
+        for thread in &self.threads {
+            for node in &thread.direction {
+                nodes.insert(node);
+            }
+            for pair in thread.direction.windows(2) {
+                let (from, to) = (&pair[0], &pair[1]);
+                if from == to {
+                    // An edge joins two distinct nodes; a repeated node is
+                    // not a real strand-to-strand hop.
+                    continue;
+                }
+                *weights.entry((from, to)).or_insert(0.0) += 1.0;
+            }
+        }
+
+        FabricAdjacency {
+            nodes: nodes.into_iter().cloned().collect(),
+            edges: weights
+                .into_iter()
+                .map(|((from, to), conductance)| FabricEdge {
+                    from: from.clone(),
+                    to: to.clone(),
+                    conductance,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// One directed, weighted edge of the emergent fabric: the node-pair a
+/// message lineage actually traversed and its conductance (traversal
+/// multiplicity). Produced by [`FabricSnapshot::adjacency`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct FabricEdge {
+    pub from: NodeId,
+    pub to: NodeId,
+    /// Edge weight: how many thread-traversals crossed `from → to`. `1.0`
+    /// for a single use; accumulates for a worn path.
+    pub conductance: f64,
+}
+
+/// The fabric viewed as a weighted directed graph — the vertex set plus
+/// the weighted edge set — derived purely from [`Thread::direction`].
+/// This is the topology a heat-kernel / graph-Laplacian vibration
+/// generator builds `L = D − A` over. Read-only and deterministic; see
+/// [`FabricSnapshot::adjacency`] for the exact semantics.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FabricAdjacency {
+    /// Every node seen in any thread, sorted and deduplicated. Index these
+    /// `0..nodes.len()` to map node names onto Laplacian matrix rows.
+    pub nodes: Vec<NodeId>,
+    /// Directed weighted edges, sorted by `(from, to)`.
+    pub edges: Vec<FabricEdge>,
 }
 
 /// The emergent weave. Owned by the kernel behind a mutex; empty at
@@ -3093,6 +3181,194 @@ mod tests {
         let snap = bus.fabric_snapshot();
         assert_eq!(snap.distance("a", "b"), Some(5.0));
         assert_eq!(snap.distance("a", "ghost"), None);
+    }
+
+    // ----- Fabric adjacency (heat-kernel topology) -----------------------
+
+    fn snap_of(threads: Vec<Thread>) -> FabricSnapshot {
+        FabricSnapshot { threads, ..Default::default() }
+    }
+
+    fn edge(from: &str, to: &str, conductance: f64) -> FabricEdge {
+        FabricEdge { from: from.into(), to: to.into(), conductance }
+    }
+
+    /// A single thread's consecutive node-pairs become directed edges of
+    /// conductance 1, and every visited node is in the vertex set.
+    #[test]
+    fn adjacency_from_a_single_thread() {
+        let snap = snap_of(vec![Thread {
+            id: 1,
+            direction: vec!["S".into(), "A".into(), "B".into()],
+        }]);
+        let adj = snap.adjacency();
+        assert_eq!(adj.nodes, vec!["A".to_string(), "B".into(), "S".into()]);
+        assert_eq!(adj.edges, vec![edge("A", "B", 1.0), edge("S", "A", 1.0)]);
+    }
+
+    /// Conductance is traversal multiplicity: an edge crossed by N threads
+    /// weighs N. Worn desire-paths weigh more.
+    #[test]
+    fn adjacency_accumulates_conductance() {
+        let snap = snap_of(vec![
+            Thread { id: 1, direction: vec!["A".into(), "B".into()] },
+            Thread { id: 2, direction: vec!["A".into(), "B".into()] },
+            Thread { id: 3, direction: vec!["A".into(), "B".into(), "C".into()] },
+        ]);
+        let adj = snap.adjacency();
+        assert_eq!(adj.edges, vec![edge("A", "B", 3.0), edge("B", "C", 1.0)]);
+    }
+
+    /// Edges are directed: A→B and B→A are distinct (a generator
+    /// symmetrizes; the fabric reports faithfully).
+    #[test]
+    fn adjacency_keeps_direction() {
+        let snap = snap_of(vec![
+            Thread { id: 1, direction: vec!["A".into(), "B".into()] },
+            Thread { id: 2, direction: vec!["B".into(), "A".into()] },
+        ]);
+        let adj = snap.adjacency();
+        assert_eq!(adj.edges, vec![edge("A", "B", 1.0), edge("B", "A", 1.0)]);
+    }
+
+    /// A self-loop (same node twice in a row) is not a real edge — skipped,
+    /// keeping the adjacency diagonal zero — but the node still counts as a
+    /// vertex.
+    #[test]
+    fn adjacency_skips_self_loops() {
+        let snap = snap_of(vec![Thread {
+            id: 1,
+            direction: vec!["A".into(), "A".into(), "B".into()],
+        }]);
+        let adj = snap.adjacency();
+        assert_eq!(adj.nodes, vec!["A".to_string(), "B".into()]);
+        assert_eq!(adj.edges, vec![edge("A", "B", 1.0)]);
+    }
+
+    /// A one-node thread (a lineage that never moved) is an isolated
+    /// vertex: present in `nodes`, absent from `edges`.
+    #[test]
+    fn adjacency_includes_isolated_node() {
+        let snap = snap_of(vec![
+            Thread { id: 1, direction: vec!["lonely".into()] },
+            Thread { id: 2, direction: vec!["A".into(), "B".into()] },
+        ]);
+        let adj = snap.adjacency();
+        assert_eq!(adj.nodes, vec!["A".to_string(), "B".into(), "lonely".into()]);
+        assert_eq!(adj.edges, vec![edge("A", "B", 1.0)]);
+    }
+
+    /// Empty fabric → empty adjacency.
+    #[test]
+    fn adjacency_of_empty_fabric_is_empty() {
+        let adj = FabricSnapshot::default().adjacency();
+        assert!(adj.nodes.is_empty());
+        assert!(adj.edges.is_empty());
+    }
+
+    /// `nodes` and `edges` are deterministically sorted regardless of the
+    /// order threads are presented in.
+    #[test]
+    fn adjacency_is_sorted_and_deterministic() {
+        let snap = snap_of(vec![
+            Thread { id: 9, direction: vec!["Z".into(), "Y".into()] },
+            Thread { id: 1, direction: vec!["M".into(), "A".into()] },
+        ]);
+        let adj = snap.adjacency();
+        assert_eq!(adj.nodes, vec!["A".to_string(), "M".into(), "Y".into(), "Z".into()]);
+        assert_eq!(adj.edges, vec![edge("M", "A", 1.0), edge("Z", "Y", 1.0)]);
+    }
+
+    /// End-to-end: a real two-hop flow through the bus produces an
+    /// adjacency that mirrors the desire-path the message actually took.
+    #[test]
+    fn adjacency_reflects_real_flow() {
+        #[derive(Clone)]
+        struct P;
+        #[derive(Clone)]
+        struct Q;
+        register_clone_type::<P>();
+        register_clone_type::<Q>();
+
+        struct Src {
+            sent: bool,
+        }
+        impl Strand for Src {
+            fn name(&self) -> &str {
+                "source"
+            }
+            fn inputs(&self) -> &[Socket] {
+                &[]
+            }
+            fn outputs(&self) -> &[Socket] {
+                const S: Socket = Socket::new::<P>("p");
+                std::slice::from_ref(&S)
+            }
+            fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+                if !self.sent {
+                    bus.publish("p", P)?;
+                    self.sent = true;
+                }
+                bus.sleep(Duration::from_millis(10));
+                Ok(())
+            }
+        }
+        struct Relay;
+        impl Strand for Relay {
+            fn name(&self) -> &str {
+                "relay"
+            }
+            fn inputs(&self) -> &[Socket] {
+                const S: Socket = Socket::new::<P>("p");
+                std::slice::from_ref(&S)
+            }
+            fn outputs(&self) -> &[Socket] {
+                const S: Socket = Socket::new::<Q>("q");
+                std::slice::from_ref(&S)
+            }
+            fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+                for _ in bus.recv_all::<P>()? {
+                    bus.publish("q", Q)?;
+                }
+                bus.sleep(Duration::from_millis(10));
+                Ok(())
+            }
+        }
+        struct Snk;
+        impl Strand for Snk {
+            fn name(&self) -> &str {
+                "sink"
+            }
+            fn inputs(&self) -> &[Socket] {
+                const S: Socket = Socket::new::<Q>("q");
+                std::slice::from_ref(&S)
+            }
+            fn outputs(&self) -> &[Socket] {
+                &[]
+            }
+            fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+                let _ = bus.recv_all::<Q>()?;
+                bus.sleep(Duration::from_millis(10));
+                Ok(())
+            }
+        }
+
+        let mut bus = Bus::open();
+        bus.register(Snk);
+        bus.register(Relay);
+        bus.register(Src { sent: false });
+        bus.run_until(Some(Duration::from_millis(400)));
+
+        let adj = bus.fabric_snapshot().adjacency();
+        // The lineage flowed source -> relay -> sink; assert that chain of
+        // edges exists with positive conductance.
+        let has = |from: &str, to: &str| {
+            adj.edges
+                .iter()
+                .any(|e| e.from == from && e.to == to && e.conductance >= 1.0)
+        };
+        assert!(has("source", "relay"), "expected a source->relay edge, got {:?}", adj.edges);
+        assert!(has("relay", "sink"), "expected a relay->sink edge, got {:?}", adj.edges);
     }
 
     // ----- Strand-name collision detection (H4) ---------------------------
