@@ -90,6 +90,45 @@ Status: **Complete** (2026-06-10), hardened 2026-06-12.
 - **Dead `leaked_for_lookup` helper removed.** It was a v1.2
   placeholder for the v1.2 limitation we just fixed.
 
+## v1.3 — The highway: the parallel layer (Layer 2, in progress)
+
+Status: **In progress** (started 2026-06-21).
+
+Everything before this is Layer 0/1 — local streets. Messages fan out
+by type and strands tick at their own pace. v1.3 builds the **highway
+above it**: the parallel layer where a batch of work is lifted off the
+ground, processed across many lanes at once, and dropped back down.
+
+- `highway` crate. Depends on `spiderweb`; the kernel does **not**
+  depend on it (higher layer wraps lower).
+- `Highway<I, O>` — a standalone pool of lane threads running one
+  transform. `on_ramp(item)` promotes work; `off_ramp()` collects
+  finished results in completion order. Plain `std` threads/channels,
+  no new deps. Lanes poll a shared job queue with a 1ms park (the
+  kernel's own idiom); the lock is held only for the non-blocking
+  `try_recv`, so lanes run `f` in true parallel. `Drop` closes the
+  on-ramp and joins every lane — no leaked threads.
+- `HighwayStrand<I, O>` — the on-ramp/off-ramp pair as a `Strand`. It
+  subscribes to an input type (on-ramp), feeds each message onto the
+  highway, and re-publishes results as an output type (off-ramp). Use
+  distinct newtypes for `I` and `O` — routing is by `TypeId`.
+- `highway` demo: 12 parcels × 150ms across 6 lanes finishes in ~two
+  rounds (~320ms) vs. ~1.8s serial. The speedup is the point.
+- Tests: 5 unit (parallelism proof, correctness, single-lane boundary,
+  zero-lane panic) + 1 bus integration (round trip through the ramps).
+
+### Still to build for v1.3
+
+- **Threads** — paths that form as messages flow (desire paths through
+  many nodes), not just a single on-ramp→off-ramp hop.
+- **Intersections** — where two threads cross at a node, with a
+  transfer policy for hopping between them.
+- **Vibration / backpressure** — when lanes are saturated, signal
+  upstream to slow or reroute instead of letting the on-ramp queue grow
+  unbounded.
+- **Preloading** — prefetch the next node's input while the current
+  lane computes.
+
 ## What's next (v2, not now)
 
 - **Edge transport** (TCP/QUIC) for cross-process strands.
@@ -108,7 +147,7 @@ Status: **Complete** (2026-06-10), hardened 2026-06-12.
 
 ---
 
-## v1.2 demos
+## Demos
 
 Run via `webctl run <name>` or `cargo run -p <pkg> --example <name>`.
 
@@ -118,6 +157,7 @@ Run via `webctl run <name>` or `cargo run -p <pkg> --example <name>`.
 | `demo-v1-1` | cap-source | Crash recovery, restart attempts, quarantine |
 | `backpressure` | cap-source | Fast source + slow sink; independent subscribers |
 | `image-pipeline` | cap-image | Real bytes (base64) through the bus; load/resize/save; observable fan-out via `-A` / `-B` suffix |
+| `highway` | highway | On-ramp a batch to the parallel layer, process across lanes, off-ramp results; ~5–6× faster than serial |
 
 ## Tests
 

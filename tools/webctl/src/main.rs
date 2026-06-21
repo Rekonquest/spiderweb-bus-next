@@ -52,6 +52,13 @@ const DEMOS: &[Demo] = &[
         description: "v1.2: load PNG, resize, save. Real bytes through the bus (base64).",
         estimated_duration: Duration::from_secs(8),
     },
+    Demo {
+        name: "highway",
+        package: "highway",
+        example: "highway",
+        description: "v1.3: on-ramp a batch to the parallel layer, process across lanes, off-ramp results. Proves the highway beats serial.",
+        estimated_duration: Duration::from_secs(3),
+    },
 ];
 
 fn main() {
@@ -74,7 +81,7 @@ fn main() {
         "topology" | "top" => show_topology(),
         "version" | "--version" | "-v" => {
             println!("webctl {}", VERSION);
-            println!("spiderweb v1.2");
+            println!("spiderweb v1.3");
         }
         "help" | "--help" | "-h" => {
             print_help();
@@ -86,7 +93,7 @@ fn main() {
 }
 
 fn list_demos() {
-    println!("🕸️  spiderweb demos (v1.2):\n");
+    println!("🕸️  spiderweb demos (v1.3):\n");
     for (i, demo) in DEMOS.iter().enumerate() {
         let dur = format!("{}s", demo.estimated_duration.as_secs());
         println!(
@@ -129,24 +136,25 @@ fn run_demo(name: &str) {
 }
 
 fn show_topology() {
-    println!("🕸️  spiderweb bus topology (v1.2):\n");
+    println!("🕸️  spiderweb bus topology (v1.3):\n");
     println!("Strand types:");
     println!("  cap-source       — publisher (String payload)");
     println!("  cap-sink         — subscriber (String payload)");
     println!("  cap-slow-sink    — slow subscriber (sleeps per msg)");
     println!("  cap-crasher      — test harness (crashes on Nth tick)");
     println!("  cap-image-*      — image processing (load/resize/save)");
+    println!("  highway-strand   — Layer 2 on-ramp/off-ramp around a parallel lane pool");
     println!("  spider           — orchestrator (subscribes to sys.lifecycle)");
     println!();
     println!("Reserved sockets:");
     println!("  sys.lifecycle    — kernel → orchestrator events");
-    println!("  sys.control      — orchestrator → kernel commands (v1.3)");
+    println!("  sys.control      — orchestrator → kernel commands");
     println!();
     println!("Run `webctl list` to see the demo topologies.");
 }
 
 fn print_help() {
-    println!("🕸️  webctl — spiderweb bus CLI (v1.2)\n");
+    println!("🕸️  webctl — spiderweb bus CLI (v1.3)\n");
     println!("USAGE:");
     println!("    webctl <command>\n");
     println!("COMMANDS:");

@@ -137,6 +137,61 @@ issue a `ControlMsg`. v1.2 fallback: if no spider is registered, the
 kernel auto-restarts strands up to 3 times (v1.1 behavior). v1.3 will
 remove the fallback.
 
+### Highway (Layer 2, the parallel layer — v1.3)
+
+Everything above is the **ground level**: local streets, where strands
+tick at their own pace and messages fan out by type. The highway is the
+fast lane **above** it. It lives in its own crate (`highway`) that
+depends on `spiderweb` — the kernel never depends on the highway, since
+a higher layer wraps the lower one, not the reverse.
+
+```rust
+pub struct Highway<I, O> { /* a pool of lane threads running one transform */ }
+
+impl<I, O> Highway<I, O> {
+    pub fn new<F: Fn(I) -> O + Send + Sync + 'static>(lanes: usize, f: F) -> Self;
+    pub fn on_ramp(&self, item: I) -> Result<(), HighwayError>; // promote to the highway
+    pub fn off_ramp(&self) -> Vec<O>;                           // demote finished results
+    pub fn lanes(&self) -> usize;
+}
+```
+
+- **On-ramp** — `on_ramp(item)` lifts one item off the ground and onto
+  the highway. The next free lane picks it up.
+- **Lanes** — `lanes` worker threads, each running the same transform
+  `I -> O` in parallel. They pull from one shared job queue, holding
+  the lock only for a non-blocking `try_recv` so the transform itself
+  runs fully in parallel. Idle lanes park 1ms and retry — the kernel's
+  own polling idiom, no Tokio.
+- **Off-ramp** — `off_ramp()` collects whatever the lanes have finished,
+  in **completion order** (unordered, like ground-level fan-out).
+- Dropping a `Highway` closes the on-ramp and joins every lane. No
+  leaked threads.
+
+The point is throughput: a batch of `N` items across `lanes` lanes
+finishes in `ceil(N / lanes)` rounds instead of `N` serial steps. The
+`highway` demo shows 12 × 150ms work finishing in ~320ms on 6 lanes vs.
+~1.8s serial.
+
+#### HighwayStrand — the ramps on the bus
+
+`HighwayStrand<I, O>` is a regular `Strand` that hosts a `Highway`
+segment and wires it to the ground bus. Each tick it on-ramps every
+inbound message of type `I` and off-ramps finished results as type `O`:
+
+```rust
+bus.register(HighwayStrand::<Work, Done>::new(
+    "square-highway", "in.work", "out.done", /* lanes = */ 4,
+    |Work(n)| Done(n * n),
+));
+```
+
+Routing is by `TypeId`, so `I` and `O` must be **distinct newtypes**,
+and both must be registered with `register_clone_type::<T>()` at boot
+(unless built-in). The strand is pure elevation — it does no work
+itself; the parallelism lives in the highway's lane threads, which run
+independently of the strand's tick.
+
 ### webctl (the CLI)
 
 `webctl` is a launcher CLI for the demos. It compiles a release binary that
@@ -218,8 +273,9 @@ The kernel:
 
 1. `spiderweb` — the kernel + `Strand` + `BusHandle` + `Socket` + clone registry.
 2. `spider` — the orchestrator.
-3. `cap-source`, `cap-sink`, `cap-slow-sink`, `cap-crasher`, `cap-image` — example strands.
-4. `webctl` — the CLI.
-5. Demos: `demo`, `demo_v1_1`, `backpressure`, `image-pipeline`.
+3. `highway` — Layer 2: `Highway` + `HighwayStrand` (on-ramps, lanes, off-ramps).
+4. `cap-source`, `cap-sink`, `cap-slow-sink`, `cap-crasher`, `cap-image` — example strands.
+5. `webctl` — the CLI.
+6. Demos: `demo`, `demo_v1_1`, `backpressure`, `image-pipeline`, `highway`.
 
 Each step ends with a runnable test.

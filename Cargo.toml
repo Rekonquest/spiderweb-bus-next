@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/spiderweb",
     "crates/spider",
+    "crates/highway",
     "crates/cap-source",
     "crates/cap-sink",
     "crates/cap-slow-sink",
@@ -20,3 +21,4 @@ rust-version = "1.75"
 [workspace.dependencies]
 spiderweb = { path = "crates/spiderweb" }
 spider = { path = "crates/spider" }
+highway = { path = "crates/highway" }
