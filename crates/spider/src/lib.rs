@@ -5,9 +5,11 @@
 //! - 1st, 2nd, 3rd crash → publish `ControlMsg::Restart` to `sys.control`.
 //! - 4th crash → publish `ControlMsg::Quarantine` to `sys.control`.
 //!
-//! The kernel executes the spider's decisions. v1.2: the kernel still
-//! has a default auto-restart policy for demos without a spider. v1.3:
-//! kernel will be policy-free and rely entirely on the spider.
+//! The kernel executes the spider's decisions but carries NO crash
+//! policy of its own (as of v1.3). On a crash the kernel waits for the
+//! spider's `ControlMsg`; with no spider registered, a crashed strand
+//! simply stays dead. The 3-restart-then-quarantine rule lives here, in
+//! the orchestrator — mechanism in the primitive, policy in the spider.
 
 use spiderweb::{
     BusHandle, ControlMsg, LifecycleEvent, Socket, Strand, StrandError, Vibration, SYS_CONTROL,
@@ -76,10 +78,10 @@ impl Strand for Spider {
                 }
                 LifecycleEvent::Crashed { name, reason } => {
                     bus.log(&format!("💥 {} crashed: {}", name, reason));
-                    // v1.2: the spider drives the restart policy. We
-                    // use the same 3-restart-then-quarantine rule
-                    // v1.1 had, but the spider sends the control
-                    // message instead of the kernel deciding.
+                    // The spider owns the restart policy: 3 restarts,
+                    // then quarantine. It sends the control message; the
+                    // kernel only executes it (the kernel decides nothing
+                    // about crashes on its own).
                     let count = self.restarts.entry(name.clone()).or_insert(0);
                     *count += 1;
                     if *count <= 3 {

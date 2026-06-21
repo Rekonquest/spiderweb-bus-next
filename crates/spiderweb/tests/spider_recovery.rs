@@ -10,7 +10,10 @@
 //! the spider, and asserts on lifecycle behavior.
 
 use spider::Spider;
-use spiderweb::{Bus, BusHandle, Socket, Strand, StrandError, StrandSpec};
+use spiderweb::{
+    Bus, BusHandle, ControlMsg, LifecycleEvent, Socket, Strand, StrandError, StrandSpec,
+    SYS_CONTROL, SYS_LIFECYCLE,
+};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -223,4 +226,202 @@ fn live_strand_runs_normally() {
     // No assertion on counts — we just want to verify this
     // doesn't panic or hang. If we get here, the bus exited
     // cleanly.
+}
+
+/// `Bus::run()` must wind down when a crashed strand has NO spider AND no
+/// factory (a live strand registered via `Bus::register`). This is a
+/// distinct branch of the Crashed arm from the spec-strand case: a live
+/// strand can never be revived by anyone, so the no-spider crash is
+/// terminal and must be counted toward shutdown. Without that, `run()`
+/// would hang on a single live-strand crash.
+#[test]
+fn run_winds_down_without_spider_when_live_strand_crashes() {
+    use std::sync::mpsc;
+
+    let count = Arc::new(AtomicU32::new(0));
+    let counter = count.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+
+    let worker = std::thread::spawn(move || {
+        let mut bus = Bus::open();
+        bus.register(LiveCrasher { count: counter });
+        // No spider, live strand: the crash is terminal.
+        bus.run();
+        let _ = done_tx.send(());
+    });
+
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Bus::run() should wind down after the lone live strand crashes (no spider)");
+    worker.join().unwrap();
+
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "the live strand should crash exactly once before the web winds down"
+    );
+}
+
+/// A minimal test orchestrator: it quarantines the first strand it sees
+/// crash, then detaches (clean exit). Registered as the spider so a
+/// crashed strand is PARKED (not counted at crash time) — the only thing
+/// that can then retire the parked victim is the `done_count` increment
+/// in the kernel's Quarantine arm. If that accounting regresses, the run
+/// loop can never reach `done_count >= total_slots` and `Bus::run()`
+/// hangs. This is the quarantine-path analogue of the crash-path
+/// wind-down test.
+struct QuarantineThenDetach;
+
+impl Strand for QuarantineThenDetach {
+    fn name(&self) -> &str {
+        "quarantiner"
+    }
+    fn inputs(&self) -> &[Socket] {
+        const S: Socket = Socket::new::<LifecycleEvent>(SYS_LIFECYCLE);
+        std::slice::from_ref(&S)
+    }
+    fn outputs(&self) -> &[Socket] {
+        const S: Socket = Socket::new::<ControlMsg>(SYS_CONTROL);
+        std::slice::from_ref(&S)
+    }
+    fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+        for (sock, evt) in bus.recv_all::<LifecycleEvent>()? {
+            if sock != SYS_LIFECYCLE {
+                continue;
+            }
+            if let LifecycleEvent::Crashed { name, reason } = evt {
+                bus.publish_static(
+                    SYS_CONTROL,
+                    ControlMsg::Quarantine {
+                        name: name.clone(),
+                        reason: format!("test-quarantine: {}", reason),
+                    },
+                )?;
+                // Work done — exit cleanly. The only slot left to retire
+                // is the parked victim, via the Quarantine accounting.
+                return Err(StrandError::Detach);
+            }
+        }
+        bus.sleep(Duration::from_millis(5));
+        Ok(())
+    }
+}
+
+#[test]
+fn quarantine_winds_down_run_via_accounting() {
+    use std::sync::mpsc;
+
+    let ticks = Arc::new(AtomicU32::new(0));
+    let ticks_factory = ticks.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+
+    let worker = std::thread::spawn(move || {
+        let mut bus = Bus::open();
+        bus.register_spec(StrandSpec::new("always-crash", move || {
+            Box::new(AlwaysCrash {
+                ticks: ticks_factory.clone(),
+            })
+        }));
+        bus.register_spider(StrandSpec::new("quarantiner", || {
+            Box::new(QuarantineThenDetach)
+        }));
+        bus.run();
+        let _ = done_tx.send(());
+    });
+
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Bus::run() should wind down once the parked strand is quarantined and the quarantiner detaches");
+    worker.join().unwrap();
+
+    assert_eq!(
+        ticks.load(Ordering::SeqCst),
+        1,
+        "the victim crashes once, is parked, then quarantined — never restarted"
+    );
+}
+
+/// A strand that publishes `ControlMsg::Quarantine` for a name that is
+/// not in the slot table. Used to prove a stale/duplicate Quarantine
+/// does NOT advance shutdown accounting.
+struct GhostQuarantiner {
+    sent: bool,
+}
+
+impl Strand for GhostQuarantiner {
+    fn name(&self) -> &str {
+        "ghost-quarantiner"
+    }
+    fn inputs(&self) -> &[Socket] {
+        &[]
+    }
+    fn outputs(&self) -> &[Socket] {
+        const S: Socket = Socket::new::<ControlMsg>(SYS_CONTROL);
+        std::slice::from_ref(&S)
+    }
+    fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+        if !self.sent {
+            for _ in 0..8 {
+                bus.publish_static(
+                    SYS_CONTROL,
+                    ControlMsg::Quarantine {
+                        name: "ghost-never-existed".to_string(),
+                        reason: "stale".to_string(),
+                    },
+                )?;
+            }
+            self.sent = true;
+        }
+        bus.sleep(Duration::from_millis(5));
+        Ok(())
+    }
+}
+
+struct Heartbeat {
+    beats: Arc<AtomicU32>,
+}
+
+impl Strand for Heartbeat {
+    fn name(&self) -> &str {
+        "heartbeat"
+    }
+    fn inputs(&self) -> &[Socket] {
+        &[]
+    }
+    fn outputs(&self) -> &[Socket] {
+        &[]
+    }
+    fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+        self.beats.fetch_add(1, Ordering::SeqCst);
+        bus.sleep(Duration::from_millis(10));
+        Ok(())
+    }
+}
+
+/// A Quarantine for a name that is not in the slot table must NOT advance
+/// shutdown accounting. Otherwise a stale/duplicate Quarantine inflates
+/// `done_count` and can trip `done_count >= total_slots`, shutting the
+/// bus down while live strands are still running. Here 8 ghost
+/// quarantines would (unguarded) push `done_count` past `total_slots`
+/// almost instantly; with the guard the heartbeat keeps ticking until
+/// max_duration.
+#[test]
+fn stale_quarantine_does_not_shut_down_the_bus() {
+    let beats = Arc::new(AtomicU32::new(0));
+
+    let mut bus = Bus::open();
+    bus.register(Heartbeat {
+        beats: beats.clone(),
+    });
+    bus.register_spider(StrandSpec::new("ghost-quarantiner", || {
+        Box::new(GhostQuarantiner { sent: false })
+    }));
+    bus.run_until(Some(Duration::from_millis(300)));
+
+    let n = beats.load(Ordering::SeqCst);
+    assert!(
+        n >= 5,
+        "heartbeat should keep ticking (got {} beats); a stale quarantine must not shut the bus down",
+        n
+    );
 }

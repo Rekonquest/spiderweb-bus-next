@@ -308,6 +308,37 @@ the orchestrator's job. v1.3 removes it.
   stays dead); `spider_restarts_then_succeeds` and
   `spider_quarantines_after_max_crashes` still pass unchanged.
 
+**Self-review caught a regression + review hardening.** Removing the
+fallback first left `Bus::run()` (`run_until(None)`) able to hang: it
+terminates on `done_count >= total_slots`, and a parked crashed strand
+never incremented `done_count`. Restored run-loop *accounting* (not
+policy): with no spider a crash is terminal, so the kernel counts it and
+winds down; with a spider it parks and waits. A multi-agent adversarial
+review then surfaced five more issues, all fixed:
+
+- **Stale `Quarantine` accounting could over-count.** The arm
+  incremented `done_count` unconditionally; a stale/duplicate Quarantine
+  for an absent name inflated the count and could trip shutdown while
+  live strands ran. Now gated on a real removal
+  (`remove(..).is_some()`). Pinned by `stale_quarantine_does_not_shut_down_the_bus`.
+- **Three stale comments/docs** that still described the removed kernel
+  fallback (spider crate header, the `pending_restarts` comment, the
+  inline crash comment) rewritten to match the code.
+- **Two test-coverage gaps** closed: `run_winds_down_without_spider_after_crash`
+  + `..._when_live_strand_crashes` (spiderless `run()` winds down for both
+  spec and live strands) and `quarantine_winds_down_run_via_accounting`
+  (a detaching quarantiner makes the quarantine `done_count` increment
+  load-bearing, so a regression there hangs the test instead of passing
+  silently). Both new accounting tests were mutation-verified to fail
+  when their guard/increment is removed.
+
+**Honest limitation (pre-existing, not introduced here).** While a spider
+is registered it is itself a never-exiting slot counted in `total_slots`,
+so `Bus::run()` / `run_until(None)` does not self-terminate via
+accounting even after every worker strand finishes — stop such a web with
+`run_until(Some(_))` or a `ControlMsg::Shutdown`. Excluding the
+orchestrator from the shutdown tally is a separate, larger change (v2).
+
 ### Still to build for v1.3
 
 - **Per-message precise fan-in** is opt-in (`recv_tagged` /

@@ -1559,11 +1559,12 @@ impl Bus {
             kernel.slots.lock().unwrap().insert(name.to_string(), slot);
         }
 
-        // Pending actions: when a strand crashes, we mark it for
-        // restart-by-default. The spider can override with a
-        // Quarantine via `sys.control`. The kernel's "default" is
-        // to restart indefinitely, but the spider sets the actual
-        // policy.
+        // Per-strand restart attempt counter, used ONLY to label
+        // `Restarted` lifecycle events with an attempt number when the
+        // spider sends `ControlMsg::Restart`. The kernel makes no restart
+        // decision of its own — all restart/quarantine policy lives in the
+        // spider (the kernel is a dumb primitive). It does not drive any
+        // "restart-by-default" behavior.
         let mut pending_restarts: HashMap<String, u32> = HashMap::new();
         let start = Instant::now();
         let mut done_count: usize = 0;
@@ -1624,12 +1625,23 @@ impl Bus {
                         }
                         ControlMsg::Quarantine { name, reason } => {
                             // The spider gave up on this strand: drop it.
+                            // Only count it toward shutdown if it was
+                            // actually present — a parked crashed strand
+                            // was NOT counted at crash time, so its removal
+                            // here balances that. A stale/duplicate
+                            // Quarantine (name already gone) must NOT
+                            // increment `done_count`, or the phantom count
+                            // could reach `total_slots` and shut the bus
+                            // down while live strands are still running.
                             kernel.publish_lifecycle(LifecycleEvent::Quarantined {
                                 name: name.clone(),
                                 reason: reason.clone(),
                             });
-                            kernel.slots.lock().unwrap().remove(name.as_str());
-                            done_count += 1;
+                            let removed =
+                                kernel.slots.lock().unwrap().remove(name.as_str()).is_some();
+                            if removed {
+                                done_count += 1;
+                            }
                         }
                         ControlMsg::Shutdown => {
                             println!(
