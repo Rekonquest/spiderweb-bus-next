@@ -343,6 +343,21 @@ impl FabricSnapshot {
     /// drop-in swap once such counters exist.) Self-loops (`from == to`)
     /// are skipped, so the diagonal of the resulting adjacency is zero.
     ///
+    /// **Conductance counts thread *segments*, so it is weighted by
+    /// downstream branching.** A Stay fan-out forks a sibling thread per
+    /// extra subscriber, and each sibling carries the full shared prefix —
+    /// so every edge *upstream* of a fan-out hub is counted once per
+    /// downstream branch (one message into a hub with `N` Stay subscribers
+    /// gives the upstream edge conductance `N`, each downstream edge `1`).
+    /// The number is "lineage-segments that crossed this edge," **not**
+    /// "distinct messages": a generator cannot tell `N` independent
+    /// crossings from one crossing that fanned out `N` ways. This is
+    /// intentional and pinned by a test, but it inflates the degree matrix
+    /// `D` near hubs — a generator wanting true per-message flow normalizes
+    /// by the branching it observes. (That normalization is the generator's
+    /// policy, exactly like the symmetrization below — the fabric only
+    /// reports its edge index.)
+    ///
     /// This is the adjacency a graph-Laplacian / heat-kernel vibration
     /// generator consumes: build `L = D − A` over [`FabricAdjacency::nodes`]
     /// and propagate one column of `H_t = exp(−t·L)` by sparse mat-vecs.
@@ -353,11 +368,11 @@ impl FabricSnapshot {
     /// own edge index and makes no routing or attenuation decision; no
     /// positions are involved.
     ///
-    /// Deterministic: `nodes` is sorted/deduplicated and `edges` is sorted
-    /// by `(from, to)`, mirroring [`Fabric::snapshot`]'s ordering so golden
-    /// tests stay stable. A node that appears in a one-node thread (a
-    /// lineage that never moved) is an isolated vertex — present in
-    /// `nodes`, absent from `edges`, degree `0`.
+    /// Deterministic, like every collection in the snapshot: `nodes` is
+    /// sorted/deduplicated and `edges` is sorted by `(from, to)`, so golden
+    /// tests and scene exports stay stable. A node that appears in a
+    /// one-node thread (a lineage that never moved) is an isolated vertex —
+    /// present in `nodes`, absent from `edges`, degree `0`.
     pub fn adjacency(&self) -> FabricAdjacency {
         use std::collections::{BTreeMap, BTreeSet};
 
@@ -400,8 +415,10 @@ impl FabricSnapshot {
 pub struct FabricEdge {
     pub from: NodeId,
     pub to: NodeId,
-    /// Edge weight: how many thread-traversals crossed `from → to`. `1.0`
-    /// for a single use; accumulates for a worn path.
+    /// Edge weight: how many thread *segments* crossed `from → to`. `1.0`
+    /// for a single use; accumulates for a worn path, and is weighted by
+    /// downstream branching at a Stay fan-out (see
+    /// [`FabricSnapshot::adjacency`] for the exact semantics).
     pub conductance: f64,
 }
 
@@ -3369,6 +3386,109 @@ mod tests {
         };
         assert!(has("source", "relay"), "expected a source->relay edge, got {:?}", adj.edges);
         assert!(has("relay", "sink"), "expected a relay->sink edge, got {:?}", adj.edges);
+    }
+
+    /// Conductance counts thread *segments*, so an edge UPSTREAM of a Stay
+    /// fan-out is weighted by the downstream branch count: one message into
+    /// a relay with three subscribers gives the upstream `source->relay`
+    /// edge conductance 3 (one per forked sibling thread) while each
+    /// downstream `relay->sink` edge stays 1. This pins the branch-weighting
+    /// the heat-kernel generator must know to normalize for.
+    #[test]
+    fn adjacency_conductance_counts_fan_out_branches() {
+        #[derive(Clone)]
+        struct P;
+        #[derive(Clone)]
+        struct Q;
+        register_clone_type::<P>();
+        register_clone_type::<Q>();
+
+        struct Src {
+            sent: bool,
+        }
+        impl Strand for Src {
+            fn name(&self) -> &str {
+                "source"
+            }
+            fn inputs(&self) -> &[Socket] {
+                &[]
+            }
+            fn outputs(&self) -> &[Socket] {
+                const S: Socket = Socket::new::<P>("p");
+                std::slice::from_ref(&S)
+            }
+            fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+                if !self.sent {
+                    bus.publish("p", P)?;
+                    self.sent = true;
+                }
+                bus.sleep(Duration::from_millis(10));
+                Ok(())
+            }
+        }
+        struct Relay;
+        impl Strand for Relay {
+            fn name(&self) -> &str {
+                "relay"
+            }
+            fn inputs(&self) -> &[Socket] {
+                const S: Socket = Socket::new::<P>("p");
+                std::slice::from_ref(&S)
+            }
+            fn outputs(&self) -> &[Socket] {
+                const S: Socket = Socket::new::<Q>("q");
+                std::slice::from_ref(&S)
+            }
+            fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+                for _ in bus.recv_all::<P>()? {
+                    bus.publish("q", Q)?;
+                }
+                bus.sleep(Duration::from_millis(10));
+                Ok(())
+            }
+        }
+        struct Snk {
+            tag: &'static str,
+        }
+        impl Strand for Snk {
+            fn name(&self) -> &str {
+                self.tag
+            }
+            fn inputs(&self) -> &[Socket] {
+                const S: Socket = Socket::new::<Q>("q");
+                std::slice::from_ref(&S)
+            }
+            fn outputs(&self) -> &[Socket] {
+                &[]
+            }
+            fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+                let _ = bus.recv_all::<Q>()?;
+                bus.sleep(Duration::from_millis(10));
+                Ok(())
+            }
+        }
+
+        let mut bus = Bus::open();
+        bus.register(Snk { tag: "sink-a" });
+        bus.register(Snk { tag: "sink-b" });
+        bus.register(Snk { tag: "sink-c" });
+        bus.register(Relay);
+        bus.register(Src { sent: false });
+        bus.run_until(Some(Duration::from_millis(400)));
+
+        let adj = bus.fabric_snapshot().adjacency();
+        let w = |from: &str, to: &str| {
+            adj.edges
+                .iter()
+                .find(|e| e.from == from && e.to == to)
+                .map(|e| e.conductance)
+        };
+        // Upstream edge counted once per downstream branch (3 siblings).
+        assert_eq!(w("source", "relay"), Some(3.0), "edges: {:?}", adj.edges);
+        // Each downstream branch counted once.
+        assert_eq!(w("relay", "sink-a"), Some(1.0), "edges: {:?}", adj.edges);
+        assert_eq!(w("relay", "sink-b"), Some(1.0), "edges: {:?}", adj.edges);
+        assert_eq!(w("relay", "sink-c"), Some(1.0), "edges: {:?}", adj.edges);
     }
 
     // ----- Strand-name collision detection (H4) ---------------------------
