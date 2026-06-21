@@ -303,6 +303,10 @@ pub struct FabricSnapshot {
     /// Node positions in the web's 3D space (v1.3). Only placed nodes
     /// appear; an unplaced node is simply absent.
     pub positions: Vec<(NodeId, Position)>,
+    /// Per-edge traffic `(from, to, deliveries)`: how many messages have
+    /// crossed each directed edge, sorted by `(from, to)`. The raw
+    /// observed-traffic weight behind [`FabricSnapshot::adjacency`].
+    pub edge_traffic: Vec<(NodeId, NodeId, u64)>,
 }
 
 impl FabricSnapshot {
@@ -330,102 +334,88 @@ impl FabricSnapshot {
         Some(self.position(a)?.distance(self.position(b)?))
     }
 
-    /// The fabric as a weighted graph: its vertex set and its directed
-    /// edge set, read straight off the desire-paths in [`Thread::direction`].
+    /// The fabric as a weighted graph: its vertex set and its directed,
+    /// weighted edge set — the topology a graph-Laplacian / heat-kernel
+    /// vibration generator consumes (build `L = D − A` over
+    /// [`FabricAdjacency::nodes`] and propagate one column of
+    /// `H_t = exp(−t·L)` by sparse mat-vecs).
     ///
-    /// Each consecutive node-pair `(from, to)` along a thread is one
-    /// directed edge (`from` published, `to` received). An edge's
-    /// **conductance** is its *traversal multiplicity* — how many
-    /// thread-traversals crossed it — so a single use weighs `1.0` and a
-    /// worn desire-path weighs more. (The fabric tracks no per-edge byte
-    /// counters today, so traversal count is the honest observed-traffic
-    /// weight; a future bytes/sec or lane-bandwidth conductance is a
-    /// drop-in swap once such counters exist.) Self-loops (`from == to`)
-    /// are skipped, so the diagonal of the resulting adjacency is zero.
+    /// An edge `(from, to)` exists once at least one message has been
+    /// delivered across it, and its **conductance** is that real
+    /// per-delivery count ([`FabricSnapshot::edge_traffic`]) — incremented
+    /// as each message actually crosses the edge. So it is honest observed
+    /// traffic: one delivery weighs `1.0`, a worn path weighs more, and a
+    /// Stay fan-out increments each downstream edge once **without inflating
+    /// the upstream edge** (the shared thread prefix is not re-counted per
+    /// sibling). Counts are message deliveries, **not bytes** — a
+    /// single-process payload is a typed value with no serialized size (a
+    /// real wall, not a placeholder); byte/bandwidth-weighted conductance
+    /// arrives with edge transport as a drop-in swap of this same count.
     ///
-    /// **Conductance counts thread *segments*, so it is weighted by
-    /// downstream branching.** A Stay fan-out forks a sibling thread per
-    /// extra subscriber, and each sibling carries the full shared prefix —
-    /// so every edge *upstream* of a fan-out hub is counted once per
-    /// downstream branch (one message into a hub with `N` Stay subscribers
-    /// gives the upstream edge conductance `N`, each downstream edge `1`).
-    /// The number is "lineage-segments that crossed this edge," **not**
-    /// "distinct messages": a generator cannot tell `N` independent
-    /// crossings from one crossing that fanned out `N` ways. This is
-    /// intentional and pinned by a test, but it inflates the degree matrix
-    /// `D` near hubs — a generator wanting true per-message flow normalizes
-    /// by the branching it observes. (That normalization is the generator's
-    /// policy, exactly like the symmetrization below — the fabric only
-    /// reports its edge index.)
-    ///
-    /// This is the adjacency a graph-Laplacian / heat-kernel vibration
-    /// generator consumes: build `L = D − A` over [`FabricAdjacency::nodes`]
-    /// and propagate one column of `H_t = exp(−t·L)` by sparse mat-vecs.
     /// The edges are **directed** (faithful to message flow); a generator
     /// that wants a symmetric `A` folds reciprocal pairs as *it* decides
     /// (sum / average / max) — that symmetrization is the generator's
-    /// policy, not the fabric's. Pure mechanism: the kernel reports its
-    /// own edge index and makes no routing or attenuation decision; no
+    /// policy, not the fabric's. Pure mechanism: the kernel reports its own
+    /// traffic counts and makes no routing or attenuation decision; no
     /// positions are involved.
     ///
-    /// Deterministic, like every collection in the snapshot: `nodes` is
-    /// sorted/deduplicated and `edges` is sorted by `(from, to)`, so golden
-    /// tests and scene exports stay stable. A node that appears in a
-    /// one-node thread (a lineage that never moved) is an isolated vertex —
-    /// present in `nodes`, absent from `edges`, degree `0`.
+    /// `nodes` is every node seen in any thread plus every edge endpoint,
+    /// so a one-node thread (a lineage that never moved) is an isolated
+    /// degree-`0` vertex — present in `nodes`, absent from `edges`.
+    /// Deterministic, like every collection in the snapshot: `nodes`
+    /// sorted/deduplicated, `edges` sorted by `(from, to)`.
     pub fn adjacency(&self) -> FabricAdjacency {
-        use std::collections::{BTreeMap, BTreeSet};
+        use std::collections::BTreeSet;
 
         let mut nodes: BTreeSet<&NodeId> = BTreeSet::new();
-        let mut weights: BTreeMap<(&NodeId, &NodeId), f64> = BTreeMap::new();
-
         for thread in &self.threads {
             for node in &thread.direction {
                 nodes.insert(node);
             }
-            for pair in thread.direction.windows(2) {
-                let (from, to) = (&pair[0], &pair[1]);
-                if from == to {
-                    // An edge joins two distinct nodes; a repeated node is
-                    // not a real strand-to-strand hop.
-                    continue;
-                }
-                *weights.entry((from, to)).or_insert(0.0) += 1.0;
-            }
         }
+        for (from, to, _) in &self.edge_traffic {
+            // Edge endpoints are vertices even if their thread has since
+            // been evicted (edge_traffic is cumulative).
+            nodes.insert(from);
+            nodes.insert(to);
+        }
+
+        let mut edges: Vec<FabricEdge> = self
+            .edge_traffic
+            .iter()
+            .map(|(from, to, count)| FabricEdge {
+                from: from.clone(),
+                to: to.clone(),
+                conductance: *count as f64,
+            })
+            .collect();
+        edges.sort_by(|a, b| (&a.from, &a.to).cmp(&(&b.from, &b.to)));
 
         FabricAdjacency {
             nodes: nodes.into_iter().cloned().collect(),
-            edges: weights
-                .into_iter()
-                .map(|((from, to), conductance)| FabricEdge {
-                    from: from.clone(),
-                    to: to.clone(),
-                    conductance,
-                })
-                .collect(),
+            edges,
         }
     }
 }
 
-/// One directed, weighted edge of the emergent fabric: the node-pair a
-/// message lineage actually traversed and its conductance (traversal
-/// multiplicity). Produced by [`FabricSnapshot::adjacency`].
+/// One directed, weighted edge of the emergent fabric: a node-pair and
+/// its conductance — the real count of messages delivered across it.
+/// Produced by [`FabricSnapshot::adjacency`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct FabricEdge {
     pub from: NodeId,
     pub to: NodeId,
-    /// Edge weight: how many thread *segments* crossed `from → to`. `1.0`
-    /// for a single use; accumulates for a worn path, and is weighted by
-    /// downstream branching at a Stay fan-out (see
-    /// [`FabricSnapshot::adjacency`] for the exact semantics).
+    /// Edge weight: how many messages have been delivered across
+    /// `from → to` (observed traffic). `1.0` for a single delivery;
+    /// accumulates for a worn path. Counted at delivery, so a fan-out does
+    /// not inflate the upstream edge (see [`FabricSnapshot::adjacency`]).
     pub conductance: f64,
 }
 
 /// The fabric viewed as a weighted directed graph — the vertex set plus
-/// the weighted edge set — derived purely from [`Thread::direction`].
-/// This is the topology a heat-kernel / graph-Laplacian vibration
-/// generator builds `L = D − A` over. Read-only and deterministic; see
+/// the weighted edge set, derived from observed per-edge traffic. The
+/// topology a heat-kernel / graph-Laplacian vibration generator builds
+/// `L = D − A` over. Read-only and deterministic; see
 /// [`FabricSnapshot::adjacency`] for the exact semantics.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FabricAdjacency {
@@ -453,6 +443,20 @@ struct Fabric {
     /// Node positions in the web's 3D space. Pure metadata, parallel to
     /// the routing path; set via [`Bus::place`] or an advertised position.
     positions: HashMap<NodeId, Position>,
+    /// Per-edge traffic: how many messages have actually been delivered
+    /// across each directed edge `(from, to)`, incremented in
+    /// [`Fabric::record_arrival`] as lineages flow. This is the real
+    /// observed-traffic weight behind [`FabricSnapshot::adjacency`]'s
+    /// conductance — counted at delivery, so a fan-out increments each
+    /// downstream edge once and never inflates the upstream edge (the
+    /// shared prefix is not re-counted per sibling thread). Counts are
+    /// message deliveries, **not bytes**: in a single-process bus a payload
+    /// is a typed value with no serialized size — a real wall, not a
+    /// placeholder; byte/bandwidth-weighted conductance arrives with edge
+    /// transport as a drop-in swap of this same count. Cumulative (survives
+    /// thread eviction) and, like the other node-keyed indices, bounded in
+    /// practice by the live strand topology.
+    edge_traffic: HashMap<(NodeId, NodeId), u64>,
     next_thread: ThreadId,
     /// Eviction cursor: the next thread id to consider evicting. Ids
     /// are monotonic, so the oldest live thread is the lowest id at or
@@ -531,6 +535,20 @@ impl Fabric {
     /// dropping the fabric lock.
     fn record_arrival(&mut self, tid: ThreadId, node: &str) -> Vec<LifecycleEvent> {
         let mut events = Vec::new();
+
+        // The edge this delivery actually traversed: the thread's previous
+        // node -> this node. Count it once, at delivery, as real per-edge
+        // traffic. Computed before the push (and as a separate borrow) so a
+        // fan-out increments each downstream edge once and never re-counts
+        // the shared prefix per sibling thread.
+        let traversed = self.threads.get(&tid).and_then(|t| match t.direction.last() {
+            Some(last) if last == node => None, // consecutive repeat: no new edge
+            Some(last) => Some(last.clone()),
+            None => None,
+        });
+        if let Some(prev) = traversed {
+            *self.edge_traffic.entry((prev, node.to_string())).or_insert(0) += 1;
+        }
 
         if let Some(t) = self.threads.get_mut(&tid) {
             if t.direction.last().map(String::as_str) != Some(node) {
@@ -660,10 +678,17 @@ impl Fabric {
         let mut positions: Vec<(NodeId, Position)> =
             self.positions.iter().map(|(n, p)| (n.clone(), *p)).collect();
         positions.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut edge_traffic: Vec<(NodeId, NodeId, u64)> = self
+            .edge_traffic
+            .iter()
+            .map(|((from, to), n)| (from.clone(), to.clone(), *n))
+            .collect();
+        edge_traffic.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
         FabricSnapshot {
             threads,
             intersections,
             positions,
+            edge_traffic,
         }
     }
 }
@@ -3202,36 +3227,41 @@ mod tests {
 
     // ----- Fabric adjacency (heat-kernel topology) -----------------------
 
-    fn snap_of(threads: Vec<Thread>) -> FabricSnapshot {
-        FabricSnapshot { threads, ..Default::default() }
-    }
-
     fn edge(from: &str, to: &str, conductance: f64) -> FabricEdge {
         FabricEdge { from: from.into(), to: to.into(), conductance }
     }
 
-    /// A single thread's consecutive node-pairs become directed edges of
-    /// conductance 1, and every visited node is in the vertex set.
+    fn et(from: &str, to: &str, n: u64) -> (NodeId, NodeId, u64) {
+        (from.into(), to.into(), n)
+    }
+
+    /// Build a snapshot directly from a set of isolated node names (as
+    /// one-node threads) and a raw per-edge delivery table — the shape
+    /// `Fabric::snapshot` produces.
+    fn snap_with(isolated: &[&str], traffic: Vec<(NodeId, NodeId, u64)>) -> FabricSnapshot {
+        let threads = isolated
+            .iter()
+            .enumerate()
+            .map(|(i, n)| Thread { id: i as ThreadId, direction: vec![(*n).into()] })
+            .collect();
+        FabricSnapshot { threads, edge_traffic: traffic, ..Default::default() }
+    }
+
+    /// Edges and their conductances come from the per-edge delivery counts;
+    /// every edge endpoint is a vertex.
     #[test]
-    fn adjacency_from_a_single_thread() {
-        let snap = snap_of(vec![Thread {
-            id: 1,
-            direction: vec!["S".into(), "A".into(), "B".into()],
-        }]);
+    fn adjacency_from_edge_traffic() {
+        let snap = snap_with(&[], vec![et("S", "A", 1), et("A", "B", 1)]);
         let adj = snap.adjacency();
         assert_eq!(adj.nodes, vec!["A".to_string(), "B".into(), "S".into()]);
         assert_eq!(adj.edges, vec![edge("A", "B", 1.0), edge("S", "A", 1.0)]);
     }
 
-    /// Conductance is traversal multiplicity: an edge crossed by N threads
+    /// Conductance is the real delivery count: an edge crossed N times
     /// weighs N. Worn desire-paths weigh more.
     #[test]
-    fn adjacency_accumulates_conductance() {
-        let snap = snap_of(vec![
-            Thread { id: 1, direction: vec!["A".into(), "B".into()] },
-            Thread { id: 2, direction: vec!["A".into(), "B".into()] },
-            Thread { id: 3, direction: vec!["A".into(), "B".into(), "C".into()] },
-        ]);
+    fn adjacency_conductance_is_the_delivery_count() {
+        let snap = snap_with(&[], vec![et("A", "B", 3), et("B", "C", 1)]);
         let adj = snap.adjacency();
         assert_eq!(adj.edges, vec![edge("A", "B", 3.0), edge("B", "C", 1.0)]);
     }
@@ -3240,36 +3270,16 @@ mod tests {
     /// symmetrizes; the fabric reports faithfully).
     #[test]
     fn adjacency_keeps_direction() {
-        let snap = snap_of(vec![
-            Thread { id: 1, direction: vec!["A".into(), "B".into()] },
-            Thread { id: 2, direction: vec!["B".into(), "A".into()] },
-        ]);
+        let snap = snap_with(&[], vec![et("A", "B", 1), et("B", "A", 1)]);
         let adj = snap.adjacency();
         assert_eq!(adj.edges, vec![edge("A", "B", 1.0), edge("B", "A", 1.0)]);
-    }
-
-    /// A self-loop (same node twice in a row) is not a real edge — skipped,
-    /// keeping the adjacency diagonal zero — but the node still counts as a
-    /// vertex.
-    #[test]
-    fn adjacency_skips_self_loops() {
-        let snap = snap_of(vec![Thread {
-            id: 1,
-            direction: vec!["A".into(), "A".into(), "B".into()],
-        }]);
-        let adj = snap.adjacency();
-        assert_eq!(adj.nodes, vec!["A".to_string(), "B".into()]);
-        assert_eq!(adj.edges, vec![edge("A", "B", 1.0)]);
     }
 
     /// A one-node thread (a lineage that never moved) is an isolated
     /// vertex: present in `nodes`, absent from `edges`.
     #[test]
     fn adjacency_includes_isolated_node() {
-        let snap = snap_of(vec![
-            Thread { id: 1, direction: vec!["lonely".into()] },
-            Thread { id: 2, direction: vec!["A".into(), "B".into()] },
-        ]);
+        let snap = snap_with(&["lonely"], vec![et("A", "B", 1)]);
         let adj = snap.adjacency();
         assert_eq!(adj.nodes, vec!["A".to_string(), "B".into(), "lonely".into()]);
         assert_eq!(adj.edges, vec![edge("A", "B", 1.0)]);
@@ -3283,14 +3293,11 @@ mod tests {
         assert!(adj.edges.is_empty());
     }
 
-    /// `nodes` and `edges` are deterministically sorted regardless of the
-    /// order threads are presented in.
+    /// `nodes` and `edges` are deterministically sorted regardless of input
+    /// order.
     #[test]
     fn adjacency_is_sorted_and_deterministic() {
-        let snap = snap_of(vec![
-            Thread { id: 9, direction: vec!["Z".into(), "Y".into()] },
-            Thread { id: 1, direction: vec!["M".into(), "A".into()] },
-        ]);
+        let snap = snap_with(&[], vec![et("Z", "Y", 1), et("M", "A", 1)]);
         let adj = snap.adjacency();
         assert_eq!(adj.nodes, vec!["A".to_string(), "M".into(), "Y".into(), "Z".into()]);
         assert_eq!(adj.edges, vec![edge("M", "A", 1.0), edge("Z", "Y", 1.0)]);
@@ -3377,25 +3384,26 @@ mod tests {
         bus.run_until(Some(Duration::from_millis(400)));
 
         let adj = bus.fabric_snapshot().adjacency();
-        // The lineage flowed source -> relay -> sink; assert that chain of
-        // edges exists with positive conductance.
-        let has = |from: &str, to: &str| {
+        // The lineage flowed source -> relay -> sink, one message each hop,
+        // so each edge has conductance exactly 1.0 (one real delivery).
+        let w = |from: &str, to: &str| {
             adj.edges
                 .iter()
-                .any(|e| e.from == from && e.to == to && e.conductance >= 1.0)
+                .find(|e| e.from == from && e.to == to)
+                .map(|e| e.conductance)
         };
-        assert!(has("source", "relay"), "expected a source->relay edge, got {:?}", adj.edges);
-        assert!(has("relay", "sink"), "expected a relay->sink edge, got {:?}", adj.edges);
+        assert_eq!(w("source", "relay"), Some(1.0), "edges: {:?}", adj.edges);
+        assert_eq!(w("relay", "sink"), Some(1.0), "edges: {:?}", adj.edges);
     }
 
-    /// Conductance counts thread *segments*, so an edge UPSTREAM of a Stay
-    /// fan-out is weighted by the downstream branch count: one message into
-    /// a relay with three subscribers gives the upstream `source->relay`
-    /// edge conductance 3 (one per forked sibling thread) while each
-    /// downstream `relay->sink` edge stays 1. This pins the branch-weighting
-    /// the heat-kernel generator must know to normalize for.
+    /// Conductance is the real per-DELIVERY count, so a Stay fan-out
+    /// increments each downstream edge once and leaves the upstream edge at
+    /// 1 — it does NOT inflate the upstream edge by the branch count (the
+    /// thing the older thread-segment derivation got wrong). One message
+    /// into a relay with three subscribers: `source->relay` = 1, each
+    /// `relay->sink` = 1.
     #[test]
-    fn adjacency_conductance_counts_fan_out_branches() {
+    fn adjacency_fan_out_does_not_inflate_upstream() {
         #[derive(Clone)]
         struct P;
         #[derive(Clone)]
@@ -3483,9 +3491,10 @@ mod tests {
                 .find(|e| e.from == from && e.to == to)
                 .map(|e| e.conductance)
         };
-        // Upstream edge counted once per downstream branch (3 siblings).
-        assert_eq!(w("source", "relay"), Some(3.0), "edges: {:?}", adj.edges);
-        // Each downstream branch counted once.
+        // Upstream edge counted ONCE (one real delivery into the relay),
+        // NOT inflated to the branch count.
+        assert_eq!(w("source", "relay"), Some(1.0), "edges: {:?}", adj.edges);
+        // Each downstream branch counted once (one delivery each).
         assert_eq!(w("relay", "sink-a"), Some(1.0), "edges: {:?}", adj.edges);
         assert_eq!(w("relay", "sink-b"), Some(1.0), "edges: {:?}", adj.edges);
         assert_eq!(w("relay", "sink-c"), Some(1.0), "edges: {:?}", adj.edges);
