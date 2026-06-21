@@ -9,7 +9,10 @@
 //! has a default auto-restart policy for demos without a spider. v1.3:
 //! kernel will be policy-free and rely entirely on the spider.
 
-use spiderweb::{BusHandle, ControlMsg, LifecycleEvent, Socket, Strand, StrandError, SYS_CONTROL, SYS_LIFECYCLE};
+use spiderweb::{
+    BusHandle, ControlMsg, LifecycleEvent, Socket, Strand, StrandError, Vibration, SYS_CONTROL,
+    SYS_LIFECYCLE, SYS_VIBRATION,
+};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -38,8 +41,14 @@ impl Strand for Spider {
     }
 
     fn inputs(&self) -> &[Socket] {
-        const SOCK: Socket = Socket::new::<LifecycleEvent>(SYS_LIFECYCLE);
-        std::slice::from_ref(&SOCK)
+        // The spider feels two things: lifecycle events (who is online,
+        // who crashed) and vibrations (the web's backpressure and other
+        // cross-layer signals).
+        const SOCKS: [Socket; 2] = [
+            Socket::new::<LifecycleEvent>(SYS_LIFECYCLE),
+            Socket::new::<Vibration>(SYS_VIBRATION),
+        ];
+        &SOCKS
     }
 
     fn outputs(&self) -> &[Socket] {
@@ -107,6 +116,28 @@ impl Strand for Spider {
                 }
             }
         }
+
+        // Feel the web's vibrations. v1.3: backpressure. The spider
+        // logs it for the operator; a future spider could react by
+        // pausing a source or rerouting around the congested node.
+        for (sock, vib) in bus.recv_all::<Vibration>()? {
+            if sock != SYS_VIBRATION {
+                continue;
+            }
+            match vib {
+                Vibration::Backpressure {
+                    node,
+                    queued,
+                    in_flight,
+                    capacity,
+                } => {
+                    bus.log(&format!(
+                        "🌊 backpressure from {node}: {queued} queued ({in_flight}/{capacity} in flight)"
+                    ));
+                }
+            }
+        }
+
         bus.sleep(Duration::from_millis(50));
         Ok(())
     }

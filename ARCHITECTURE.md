@@ -192,6 +192,37 @@ and both must be registered with `register_clone_type::<T>()` at boot
 itself; the parallelism lives in the highway's lane threads, which run
 independently of the strand's tick.
 
+### Vibrations — backpressure (v1.3)
+
+A spiderweb's real power is that vibrations propagate: touch one strand
+and the rest of the web feels it. The first concrete vibration is
+**backpressure**.
+
+A `Highway` has a soft `capacity`. A `HighwayStrand` pulls inbound work
+into its own holding buffer and on-ramps only while the highway
+`has_room()`. When the highway fills, the held work stays in the
+strand's buffer — never dropped — and the strand emits a `Vibration`
+on the reserved `sys.vibration` socket:
+
+```rust
+pub enum Vibration {
+    Backpressure { node: String, queued: usize, in_flight: usize, capacity: usize },
+}
+```
+
+The `Vibration` type and `SYS_VIBRATION` socket live in the kernel
+crate, not the highway — vibration is a web-wide concept (backpressure
+now, heartbeat staleness later), so any layer can emit one and any
+strand can feel one. The spider subscribes to `sys.vibration` and logs
+backpressure; a future spider could react by pausing the source or
+rerouting around the congested node. This is **vertical signal
+propagation**: a Layer 2 highway tells Layer 3 orchestration that it is
+saturated, over the same pub/sub the rest of the bus uses.
+
+To avoid spamming the web, a strand emits a vibration only when its
+backlog depth *changes*, so a steady jam produces a clean rise-and-fall
+of signals rather than a flood.
+
 ### webctl (the CLI)
 
 `webctl` is a launcher CLI for the demos. It compiles a release binary that

@@ -68,6 +68,13 @@ pub const SYS_LIFECYCLE: &str = "sys.lifecycle";
 /// Reserved socket name. Control messages from orchestrator → kernel.
 pub const SYS_CONTROL: &str = "sys.control";
 
+/// Reserved socket name. Vibrations — cross-layer signals like
+/// backpressure — propagate here. Any layer can emit a [`Vibration`];
+/// any strand (the spider, typically) can subscribe and react. This is
+/// the web *feeling itself*: when one strand is touched, the rest can
+/// sense it without a direct wire.
+pub const SYS_VIBRATION: &str = "sys.vibration";
+
 // -----------------------------------------------------------------------------
 // Lifecycle events
 // -----------------------------------------------------------------------------
@@ -96,6 +103,31 @@ pub enum ControlMsg {
     Restart { name: String },
     Quarantine { name: String, reason: String },
     Shutdown,
+}
+
+// -----------------------------------------------------------------------------
+// Vibrations
+// -----------------------------------------------------------------------------
+
+/// A vibration on the web: a cross-layer signal that propagates so the
+/// rest of the web can feel what one part is experiencing. Emitted on
+/// [`SYS_VIBRATION`]; routed like any other typed message, so emitting
+/// and feeling a vibration uses the same pub/sub the rest of the bus
+/// does. v1.3 carries backpressure; future variants will carry
+/// heartbeat staleness and other cross-cutting signals.
+#[derive(Debug, Clone)]
+pub enum Vibration {
+    /// A node can't keep up: work is arriving faster than it drains.
+    /// `queued` items are waiting upstream of the node while
+    /// `in_flight` are already accepted against a soft `capacity`.
+    /// An upstream strand or the spider can react by slowing, pausing,
+    /// or (later) rerouting.
+    Backpressure {
+        node: String,
+        queued: usize,
+        in_flight: usize,
+        capacity: usize,
+    },
 }
 
 // -----------------------------------------------------------------------------
@@ -180,6 +212,7 @@ impl CloneRegistry {
         r.register_builtin::<bool>();
         r.register_builtin::<LifecycleEvent>();
         r.register_builtin::<ControlMsg>();
+        r.register_builtin::<Vibration>();
         r
     }
 
@@ -555,49 +588,51 @@ impl Kernel {
     const PENDING_BUFFER_CAP: usize = 32;
 
     fn subscribe(&self, type_id: TypeId, sub: Arc<Subscriber>) {
-        let subs = self.subscribers.lock().unwrap();
-        let pending = self.pending.lock().unwrap();
+        // Replay the buffer to the new subscriber AND add it to the
+        // subscriber list as a single critical section, holding both
+        // locks the whole time. This is atomic with respect to
+        // `deliver`, which holds the same two locks (same order:
+        // subscribers → pending) while it appends to the buffer and
+        // snapshots subscribers. The atomicity guarantees every
+        // message reaches this subscriber by exactly ONE path: if a
+        // concurrent `deliver` runs entirely before this section, its
+        // message is in the buffer and gets replayed here; if it runs
+        // entirely after, this subscriber is already in the list and
+        // gets a direct send. Splitting replay from the list-insert
+        // (as before) let a message slip into both paths — a double
+        // delivery — or neither — a lost message.
+        let flush_event = {
+            let mut subs = self.subscribers.lock().unwrap();
+            let pending = self.pending.lock().unwrap();
 
-        // Replay any buffered messages of this type to the new
-        // subscriber. We clone each envelope via the clone
-        // registry so the buffer itself is preserved for future
-        // subscribers. v2 should add a TTL or a smarter drain
-        // policy.
-        let flush_event = if let Some(buf) = pending.get(&type_id) {
-            let count = buf.len();
-            for (socket, env) in buf {
-                let cloned = registry().as_ref().unwrap().clone_env(env);
-                if let Err(returned) = sub.try_send(socket, cloned) {
-                    let _ = returned;
+            let evt = match pending.get(&type_id) {
+                Some(buf) if !buf.is_empty() => {
+                    let count = buf.len();
+                    for (socket, env) in buf {
+                        let cloned = registry().as_ref().unwrap().clone_env(env);
+                        if let Err(returned) = sub.try_send(socket, cloned) {
+                            let _ = returned;
+                        }
+                    }
+                    Some(LifecycleEvent::Flushed {
+                        socket: "<pending>",
+                        to: sub.name.clone(),
+                        count,
+                    })
                 }
-            }
-            Some(LifecycleEvent::Flushed {
-                socket: "<pending>",
-                to: sub.name.clone(),
-                count,
-            })
-        } else {
-            None
+                _ => None,
+            };
+
+            subs.entry(type_id).or_default().push(sub);
+            evt
         };
 
-        drop(pending);
-        drop(subs);
-
-        // IMPORTANT: must drop both mutexes BEFORE calling
-        // publish_lifecycle. publish_lifecycle → deliver_internal
-        // re-locks self.subscribers, and std::sync::Mutex is
-        // not reentrant. Holding subs/pending across the call
-        // would deadlock. (C1 fix.)
+        // Emit the Flushed event AFTER releasing both locks:
+        // publish_lifecycle → deliver_internal re-locks
+        // self.subscribers, and std::sync::Mutex is not reentrant.
         if let Some(evt) = flush_event {
             self.publish_lifecycle(evt);
         }
-
-        self.subscribers
-            .lock()
-            .unwrap()
-            .entry(type_id)
-            .or_default()
-            .push(sub);
     }
 
     fn publish_lifecycle(&self, evt: LifecycleEvent) {
@@ -618,47 +653,56 @@ impl Kernel {
     fn deliver(&self, socket: &'static str, env: Envelope, from_name: &str) {
         let type_id = (*env).type_id();
 
-        // Clone for the buffer FIRST (the buffer keeps a copy
-        // for late subscribers). Then deliver to current
-        // subscribers, also by clone. The original `env` is
-        // consumed by the for-loop.
+        // Clone the value that goes into the replay buffer. The
+        // per-subscriber clones happen below, outside the locks.
         let buffered = registry().as_ref().unwrap().clone_env(&env);
 
-        {
+        // Critical section: append to the buffer and snapshot the
+        // current subscriber set ATOMICALLY, under both locks in the
+        // same order `subscribe` uses (subscribers → pending). This is
+        // what makes delivery exactly-once: a strand subscribing
+        // concurrently either appears in this snapshot (and gets a
+        // direct send below) or replays this message from the buffer
+        // when it subscribes — never both, never neither. We snapshot
+        // the subscriber Arcs and send AFTER releasing the locks, so we
+        // never hold the registry lock while holding these two.
+        let (snapshot, was_empty) = {
+            let subs = self.subscribers.lock().unwrap();
             let mut pending = self.pending.lock().unwrap();
+
             let buf = pending.entry(type_id).or_default();
             let was_empty = buf.is_empty();
             if buf.len() >= Self::PENDING_BUFFER_CAP {
                 buf.remove(0);
             }
             buf.push((socket, buffered));
-            if was_empty {
-                // Drop the pending lock before calling
-                // publish_lifecycle (it re-locks self.subscribers).
-                drop(pending);
-                self.publish_lifecycle(LifecycleEvent::Buffered {
-                    socket,
-                    from: from_name.to_string(),
-                });
+
+            let snapshot: Vec<Arc<Subscriber>> =
+                subs.get(&type_id).cloned().unwrap_or_default();
+            (snapshot, was_empty)
+        };
+
+        // Send to the snapshot outside the locks. Each subscriber gets
+        // its own clone.
+        for sub in &snapshot {
+            let cloned = registry().as_ref().unwrap().clone_env(&env);
+            if let Err(returned) = sub.try_send(socket, cloned) {
+                eprintln!(
+                    "[{:>5}ms] [kernel] ⚠️  {} disconnected mid-deliver",
+                    self.boot.elapsed().as_millis(),
+                    sub.name
+                );
+                let _ = returned;
             }
         }
 
-        // Deliver to current subscribers. Re-lock subscribers
-        // (we dropped it above implicitly via the lock guard's
-        // scope).
-        let subs = self.subscribers.lock().unwrap();
-        if let Some(c) = subs.get(&type_id) {
-            for sub in c.iter() {
-                let cloned = registry().as_ref().unwrap().clone_env(&env);
-                if let Err(returned) = sub.try_send(socket, cloned) {
-                    eprintln!(
-                        "[{:>5}ms] [kernel] ⚠️  {} disconnected mid-deliver",
-                        self.boot.elapsed().as_millis(),
-                        sub.name
-                    );
-                    let _ = returned;
-                }
-            }
+        // Emit the Buffered lifecycle event after releasing the locks
+        // (publish_lifecycle re-locks self.subscribers).
+        if was_empty {
+            self.publish_lifecycle(LifecycleEvent::Buffered {
+                socket,
+                from: from_name.to_string(),
+            });
         }
     }
 
@@ -1496,6 +1540,59 @@ mod tests {
         let b = last_b.lock().unwrap().clone();
         assert_eq!(a, Some(payload.clone()), "sink-A should see the exact payload");
         assert_eq!(b, Some(payload.clone()), "sink-B should see the exact payload");
+    }
+
+    /// A burst published at startup, while a subscriber is still being
+    /// registered, must be delivered EXACTLY once — no duplicate, no
+    /// loss. This guards the deliver/subscribe race: if the buffer
+    /// append and the subscriber-list insert are not atomic with
+    /// respect to each other, a message can land in both the replay
+    /// and the direct-send paths (double delivery) or in neither
+    /// (loss). The race is timing-dependent, so we loop. The bug it
+    /// guards against was caught by the highway `congestion` demo
+    /// delivering 25 items from a burst of 24.
+    #[test]
+    fn burst_at_startup_delivers_exactly_once() {
+        struct BurstSource {
+            n: usize,
+            sent: bool,
+        }
+        impl Strand for BurstSource {
+            fn name(&self) -> &str {
+                "burst-source"
+            }
+            fn inputs(&self) -> &[Socket] {
+                &[]
+            }
+            fn outputs(&self) -> &[Socket] {
+                const SOCK: Socket = Socket::new::<String>("burst.out");
+                std::slice::from_ref(&SOCK)
+            }
+            fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+                if self.sent {
+                    return Err(StrandError::Detach);
+                }
+                for i in 0..self.n {
+                    bus.publish("burst.out", format!("m{i}"))?;
+                }
+                self.sent = true;
+                Ok(())
+            }
+        }
+
+        // N stays under PENDING_BUFFER_CAP (32) so the bounded buffer
+        // never drops a message and "exactly N" is the correct
+        // expectation.
+        const N: usize = 25;
+        for iter in 0..12 {
+            let (sink, count, _last) = TestSink::new("burst-sink");
+            let mut bus = Bus::open();
+            bus.register(BurstSource { n: N, sent: false });
+            bus.register(sink);
+            bus.run_until(Some(Duration::from_millis(150)));
+            let got = count.load(Ordering::SeqCst) as usize;
+            assert_eq!(got, N, "iteration {iter}: expected exactly {N}, got {got}");
+        }
     }
 
     // ----- Strand-name collision detection (H4) ---------------------------

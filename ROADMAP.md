@@ -114,8 +114,33 @@ ground, processed across many lanes at once, and dropped back down.
   distinct newtypes for `I` and `O` — routing is by `TypeId`.
 - `highway` demo: 12 parcels × 150ms across 6 lanes finishes in ~two
   rounds (~320ms) vs. ~1.8s serial. The speedup is the point.
-- Tests: 5 unit (parallelism proof, correctness, single-lane boundary,
-  zero-lane panic) + 1 bus integration (round trip through the ramps).
+
+### Vibration: backpressure (done)
+
+The first cross-layer vibration. A `Highway` has a soft `capacity`; a
+`HighwayStrand` holds inbound work it can't on-ramp yet (never dropping
+it) and emits `Vibration::Backpressure` on the reserved `sys.vibration`
+socket when its backlog changes. The `Vibration` type lives in the
+kernel (web-wide vocabulary, like `LifecycleEvent`). The spider feels it
+and logs it — Layer 2 → Layer 3 vertical propagation.
+
+- `congestion` demo: a burst of 24 overruns a 2-lane, capacity-4
+  highway; the spider logs the backlog draining (21→19→…→1) and every
+  parcel still arrives.
+- Tests across the slice: 7 highway unit (parallelism, correctness,
+  capacity/`has_room`, boundary panics) + 3 bus integration (round
+  trip, backpressure-fires-and-loses-nothing, roomy-is-silent).
+
+### Kernel fix: exactly-once delivery (done)
+
+The `congestion` demo surfaced a pre-existing deliver/subscribe race in
+the kernel: a burst published while a subscriber was registering could
+be delivered **twice** (once via buffer replay, once direct) or lost.
+`deliver` now appends to the replay buffer and snapshots subscribers
+atomically, and `subscribe` replays-and-inserts atomically, under the
+same two locks in a consistent order — so every (message, subscriber)
+pair is delivered by exactly one path. Guarded by a looped
+`burst_at_startup_delivers_exactly_once` regression test.
 
 ### Still to build for v1.3
 
@@ -123,9 +148,6 @@ ground, processed across many lanes at once, and dropped back down.
   many nodes), not just a single on-ramp→off-ramp hop.
 - **Intersections** — where two threads cross at a node, with a
   transfer policy for hopping between them.
-- **Vibration / backpressure** — when lanes are saturated, signal
-  upstream to slow or reroute instead of letting the on-ramp queue grow
-  unbounded.
 - **Preloading** — prefetch the next node's input while the current
   lane computes.
 
@@ -158,6 +180,7 @@ Run via `webctl run <name>` or `cargo run -p <pkg> --example <name>`.
 | `backpressure` | cap-source | Fast source + slow sink; independent subscribers |
 | `image-pipeline` | cap-image | Real bytes (base64) through the bus; load/resize/save; observable fan-out via `-A` / `-B` suffix |
 | `highway` | highway | On-ramp a batch to the parallel layer, process across lanes, off-ramp results; ~5–6× faster than serial |
+| `congestion` | highway | Burst overruns a small highway; it emits backpressure vibrations the spider feels, and drops nothing |
 
 ## Tests
 

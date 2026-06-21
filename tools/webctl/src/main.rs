@@ -59,6 +59,13 @@ const DEMOS: &[Demo] = &[
         description: "v1.3: on-ramp a batch to the parallel layer, process across lanes, off-ramp results. Proves the highway beats serial.",
         estimated_duration: Duration::from_secs(3),
     },
+    Demo {
+        name: "congestion",
+        package: "highway",
+        example: "congestion",
+        description: "v1.3: burst overruns a small highway; it emits backpressure vibrations the spider feels, and drops nothing.",
+        estimated_duration: Duration::from_secs(3),
+    },
 ];
 
 fn main() {
@@ -149,6 +156,7 @@ fn show_topology() {
     println!("Reserved sockets:");
     println!("  sys.lifecycle    — kernel → orchestrator events");
     println!("  sys.control      — orchestrator → kernel commands");
+    println!("  sys.vibration    — cross-layer signals (backpressure)");
     println!();
     println!("Run `webctl list` to see the demo topologies.");
 }

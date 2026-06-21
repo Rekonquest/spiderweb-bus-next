@@ -48,8 +48,10 @@
 
 #![forbid(unsafe_code)]
 
-use spiderweb::{BusHandle, Socket, Strand, StrandError};
+use spiderweb::{BusHandle, Socket, Strand, StrandError, Vibration, SYS_VIBRATION};
+use std::collections::VecDeque;
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -75,6 +77,12 @@ impl fmt::Display for HighwayError {
         }
     }
 }
+
+/// Default ratio of soft capacity to lanes. A highway lets a small
+/// pipeline of work queue ahead of its lanes (for throughput) but not
+/// an unbounded one — past `lanes * this`, [`Highway::has_room`] reports
+/// the highway is full and the caller should apply backpressure.
+const DEFAULT_CAPACITY_PER_LANE: usize = 4;
 
 impl std::error::Error for HighwayError {}
 
@@ -106,6 +114,16 @@ pub struct Highway<I, O> {
     result_rx: Receiver<O>,
     handles: Vec<JoinHandle<()>>,
     lanes: usize,
+    /// Work accepted onto the highway but not yet finished by a lane:
+    /// incremented on [`Highway::on_ramp`], decremented when a lane
+    /// produces a result. The web's congestion gauge — when it reaches
+    /// `capacity`, the highway is full.
+    in_flight: Arc<AtomicUsize>,
+    /// Soft ceiling on `in_flight`. Surfaced through
+    /// [`Highway::has_room`]; not hard-enforced by `on_ramp`, so a
+    /// caller that ignores backpressure can still over-fill (the count
+    /// stays accurate either way).
+    capacity: usize,
 }
 
 impl<I, O> Highway<I, O>
@@ -113,28 +131,44 @@ where
     I: Send + 'static,
     O: Send + 'static,
 {
-    /// Open a highway with `lanes` parallel lanes, each running `f`.
+    /// Open a highway with `lanes` parallel lanes, each running `f`,
+    /// and a default soft capacity of `lanes * 4`.
     ///
     /// Panics if `lanes` is zero — a highway needs at least one lane.
     pub fn new<F>(lanes: usize, f: F) -> Self
     where
         F: Fn(I) -> O + Send + Sync + 'static,
     {
+        Self::with_capacity(lanes, lanes * DEFAULT_CAPACITY_PER_LANE, f)
+    }
+
+    /// Open a highway with an explicit soft `capacity` — how much work
+    /// may be in flight before [`Highway::has_room`] reports the
+    /// highway is full and the caller should hold back.
+    ///
+    /// Panics if `lanes` or `capacity` is zero.
+    pub fn with_capacity<F>(lanes: usize, capacity: usize, f: F) -> Self
+    where
+        F: Fn(I) -> O + Send + Sync + 'static,
+    {
         assert!(lanes >= 1, "a highway needs at least one lane");
+        assert!(capacity >= 1, "a highway needs capacity for at least one item");
 
         let f: LaneFn<I, O> = Arc::new(f);
         let (job_tx, job_rx) = mpsc::channel::<I>();
         let job_rx = Arc::new(Mutex::new(job_rx));
         let (result_tx, result_rx) = mpsc::channel::<O>();
+        let in_flight = Arc::new(AtomicUsize::new(0));
 
         let mut handles = Vec::with_capacity(lanes);
         for lane in 0..lanes {
             let job_rx = Arc::clone(&job_rx);
             let result_tx = result_tx.clone();
             let f = Arc::clone(&f);
+            let in_flight = Arc::clone(&in_flight);
             let handle = thread::Builder::new()
                 .name(format!("highway-lane-{lane}"))
-                .spawn(move || run_lane(job_rx, result_tx, f))
+                .spawn(move || run_lane(job_rx, result_tx, f, in_flight))
                 .expect("failed to spawn highway lane");
             handles.push(handle);
         }
@@ -146,13 +180,26 @@ where
             result_rx,
             handles,
             lanes,
+            in_flight,
+            capacity,
         }
     }
 
     /// On-ramp: lift one item from the ground onto the highway. The
-    /// next free lane will pick it up. Non-blocking.
+    /// next free lane will pick it up. Non-blocking. Counts the item
+    /// as in flight; check [`Highway::has_room`] first if you want to
+    /// respect backpressure.
     pub fn on_ramp(&self, item: I) -> Result<(), HighwayError> {
-        self.job_tx.send(item).map_err(|_| HighwayError::Closed)
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        match self.job_tx.send(item) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                // Never delivered — undo the count so the gauge stays
+                // honest.
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                Err(HighwayError::Closed)
+            }
+        }
     }
 
     /// Off-ramp: take every result a lane has finished so far, in
@@ -165,6 +212,24 @@ where
     /// How many parallel lanes this highway runs.
     pub fn lanes(&self) -> usize {
         self.lanes
+    }
+
+    /// Work accepted but not yet finished — the congestion gauge.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+
+    /// The soft capacity this highway was built with.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Whether the highway can take more work without exceeding its
+    /// soft capacity. When this returns `false`, the highway is
+    /// congested and the caller should hold back and let the web feel
+    /// the backpressure.
+    pub fn has_room(&self) -> bool {
+        self.in_flight() < self.capacity
     }
 }
 
@@ -186,7 +251,12 @@ impl<I, O> Drop for Highway<I, O> {
 
 /// One lane's loop: pull a job, run the transform, push the result,
 /// repeat until the on-ramp closes.
-fn run_lane<I, O>(job_rx: Arc<Mutex<Receiver<I>>>, result_tx: Sender<O>, f: LaneFn<I, O>) {
+fn run_lane<I, O>(
+    job_rx: Arc<Mutex<Receiver<I>>>,
+    result_tx: Sender<O>,
+    f: LaneFn<I, O>,
+    in_flight: Arc<AtomicUsize>,
+) {
     loop {
         // Hold the queue lock ONLY for the non-blocking `try_recv`, so
         // other lanes can pull while this lane runs `f`. Holding the
@@ -202,6 +272,10 @@ fn run_lane<I, O>(job_rx: Arc<Mutex<Receiver<I>>>, result_tx: Sender<O>, f: Lane
         match job {
             Ok(item) => {
                 let out = f(item);
+                // The item is finished: free its capacity now, before
+                // we even hand off the result. A finished result
+                // waiting in the off-ramp is no longer "in flight".
+                in_flight.fetch_sub(1, Ordering::SeqCst);
                 if result_tx.send(out).is_err() {
                     // The off-ramp (the `Highway`) is gone. Nothing
                     // left to do.
@@ -238,9 +312,18 @@ fn run_lane<I, O>(job_rx: Arc<Mutex<Receiver<I>>>, result_tx: Sender<O>, f: Lane
 pub struct HighwayStrand<I, O> {
     name: String,
     in_sockets: [Socket; 1],
-    out_sockets: [Socket; 1],
+    out_sockets: [Socket; 2],
     out_socket: &'static str,
     highway: Highway<I, O>,
+    /// Items pulled off the ground bus but not yet on-ramped, because
+    /// the highway was full. This is the strand's own holding area: it
+    /// absorbs bursts and retries each tick, so backpressure *holds*
+    /// work rather than dropping it.
+    pending: VecDeque<I>,
+    /// Backlog depth at the last vibration we emitted. We only emit
+    /// when the depth changes, so a steady backlog doesn't spam the
+    /// web with identical vibrations.
+    last_queued: usize,
     idle: Duration,
 }
 
@@ -275,9 +358,44 @@ where
         HighwayStrand {
             name: name.into(),
             in_sockets: [Socket::new::<I>(in_socket)],
-            out_sockets: [Socket::new::<O>(out_socket)],
+            out_sockets: [
+                Socket::new::<O>(out_socket),
+                Socket::new::<Vibration>(SYS_VIBRATION),
+            ],
             out_socket,
             highway: Highway::new(lanes, transform),
+            pending: VecDeque::new(),
+            last_queued: 0,
+            idle: Duration::from_millis(5),
+        }
+    }
+
+    /// Build a highway strand with an explicit soft capacity (how much
+    /// work may be in flight before the strand starts holding inbound
+    /// messages and emitting backpressure vibrations). See
+    /// [`Highway::with_capacity`].
+    pub fn with_capacity<F>(
+        name: impl Into<String>,
+        in_socket: &'static str,
+        out_socket: &'static str,
+        lanes: usize,
+        capacity: usize,
+        transform: F,
+    ) -> Self
+    where
+        F: Fn(I) -> O + Send + Sync + 'static,
+    {
+        HighwayStrand {
+            name: name.into(),
+            in_sockets: [Socket::new::<I>(in_socket)],
+            out_sockets: [
+                Socket::new::<O>(out_socket),
+                Socket::new::<Vibration>(SYS_VIBRATION),
+            ],
+            out_socket,
+            highway: Highway::with_capacity(lanes, capacity, transform),
+            pending: VecDeque::new(),
+            last_queued: 0,
             idle: Duration::from_millis(5),
         }
     }
@@ -306,13 +424,46 @@ where
     }
 
     fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
-        // ON-RAMP: lift every inbound ground message onto the highway.
+        // INTAKE: pull every inbound ground message into the strand's
+        // holding area. We don't on-ramp directly — the highway may be
+        // full, and we never drop work.
         for (_sock, item) in bus.recv_all::<I>()? {
-            if self.highway.on_ramp(item).is_err() {
-                return Err(StrandError::Crashed(
-                    "highway on-ramp closed (lanes gone)".into(),
-                ));
+            self.pending.push_back(item);
+        }
+
+        // ON-RAMP: lift held work onto the highway while it has room.
+        // When the highway fills, we stop and leave the rest in
+        // `pending` for the next tick.
+        while self.highway.has_room() {
+            match self.pending.pop_front() {
+                Some(item) => {
+                    if self.highway.on_ramp(item).is_err() {
+                        return Err(StrandError::Crashed(
+                            "highway on-ramp closed (lanes gone)".into(),
+                        ));
+                    }
+                }
+                None => break,
             }
+        }
+
+        // VIBRATION: if work is still held back, the highway is
+        // congested — let the web feel it. We emit only when the
+        // backlog depth changes, so a steady jam doesn't spam the bus.
+        let queued = self.pending.len();
+        if queued != self.last_queued {
+            if queued > 0 {
+                bus.publish_static(
+                    SYS_VIBRATION,
+                    Vibration::Backpressure {
+                        node: self.name.clone(),
+                        queued,
+                        in_flight: self.highway.in_flight(),
+                        capacity: self.highway.capacity(),
+                    },
+                )?;
+            }
+            self.last_queued = queued;
         }
 
         // OFF-RAMP: demote every finished result back onto the ground.
@@ -410,22 +561,57 @@ mod tests {
         assert_eq!(got, vec!["a!".to_string(), "b!".to_string()]);
     }
 
-    /// Dropping the highway closes the on-ramp.
+    /// `new` gives a bounded default capacity of `lanes * 4` rather
+    /// than an unbounded queue.
     #[test]
-    fn on_ramp_closes_after_drop() {
-        let highway = Highway::new(2, |n: u64| n);
-        // Move the sender out so we can use it after drop. We can't,
-        // by design — instead verify a fresh highway accepts work and
-        // that `lanes()` reports correctly. (Drop joins lanes; a
-        // post-drop on_ramp is a compile-time impossibility since the
-        // highway is consumed.)
-        assert_eq!(highway.lanes(), 2);
-        highway.on_ramp(1).unwrap();
+    fn default_capacity_is_bounded() {
+        let highway = Highway::new(3, |n: u64| n);
+        assert_eq!(highway.capacity(), 12);
+        assert_eq!(highway.lanes(), 3);
+    }
+
+    /// `has_room` tracks in-flight work against capacity: false when the
+    /// highway fills, true again as lanes drain it. This is the gauge
+    /// backpressure rides on.
+    #[test]
+    fn has_room_reflects_capacity() {
+        // Slow lanes so work stays in flight long enough to observe.
+        let highway = Highway::with_capacity(2, 4, |n: u64| {
+            thread::sleep(Duration::from_millis(200));
+            n
+        });
+        assert!(highway.has_room(), "a fresh highway has room");
+        assert_eq!(highway.capacity(), 4);
+
+        for n in 0..4 {
+            highway.on_ramp(n).unwrap();
+        }
+        // All four are accepted but none can finish for ~200ms, so the
+        // highway is full right now.
+        assert_eq!(highway.in_flight(), 4);
+        assert!(!highway.has_room(), "highway should be full at capacity");
+
+        // Drain. Once lanes finish, capacity frees up again.
+        let mut got = 0;
+        let start = Instant::now();
+        while got < 4 && start.elapsed() < Duration::from_secs(3) {
+            got += highway.off_ramp().len();
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(got, 4);
+        assert_eq!(highway.in_flight(), 0);
+        assert!(highway.has_room(), "highway has room again after draining");
     }
 
     #[test]
     #[should_panic(expected = "at least one lane")]
     fn zero_lanes_panics() {
         let _highway = Highway::new(0, |n: u64| n);
+    }
+
+    #[test]
+    #[should_panic(expected = "capacity for at least one item")]
+    fn zero_capacity_panics() {
+        let _highway = Highway::with_capacity(2, 0, |n: u64| n);
     }
 }

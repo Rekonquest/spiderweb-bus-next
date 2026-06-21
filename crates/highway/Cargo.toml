@@ -8,3 +8,6 @@ description = "Layer 2 of the spiderweb bus: the parallel layer (on-ramps, lanes
 
 [dependencies]
 spiderweb.workspace = true
+
+[dev-dependencies]
+spider.workspace = true
