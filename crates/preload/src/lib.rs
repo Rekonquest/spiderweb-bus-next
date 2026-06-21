@@ -90,7 +90,9 @@ pub struct Preloader<T> {
     ready_rx: Receiver<T>,
     /// Signals fetchers to stop (set on drop).
     stop: Arc<AtomicBool>,
-    /// Occupancy gauge — items banked but not yet taken.
+    /// Occupancy gauge — items banked but not yet taken. An UPPER bound
+    /// on the channel's true occupancy (it can read `depth` + the number
+    /// of fetchers mid-send); the hard memory bound is the channel.
     banked: Arc<AtomicUsize>,
     /// Fetch threads still running. Zero means the source is exhausted.
     live: Arc<AtomicUsize>,
@@ -174,8 +176,9 @@ impl<T: Send + 'static> Preloader<T> {
     pub fn take(&self) -> Option<T> {
         match self.ready_rx.try_recv() {
             Ok(item) => {
-                // Saturating so a take that races just ahead of the
-                // fetcher's post-send increment can't underflow.
+                // Saturating, purely defensively — every channel item was
+                // counted before its send, so this can't actually
+                // underflow.
                 self.banked
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                         Some(n.saturating_sub(1))
@@ -198,7 +201,8 @@ impl<T: Send + 'static> Preloader<T> {
         out
     }
 
-    /// How many items are banked and ready right now.
+    /// How many items are banked and ready right now (an upper-bound
+    /// gauge — see the field doc; the hard bound is the channel depth).
     pub fn ready_len(&self) -> usize {
         self.banked.load(Ordering::SeqCst)
     }
@@ -248,6 +252,22 @@ fn run_fetcher<T>(
     seq: Arc<AtomicU64>,
     live: Arc<AtomicUsize>,
 ) {
+    // Decrement `live` on EVERY exit path — normal return, any `break`,
+    // OR a panic unwinding out of the `fetch` closure. Without this
+    // guard a panicking fetch would skip the decrement, leaving
+    // `is_exhausted()` permanently false and the `PreloadStrand`
+    // immortal (it would never detach and would spam starvation). A
+    // panicking fetch ends this worker; with one fetcher that cleanly
+    // exhausts the source, and with `with_workers` it drops the index
+    // this worker had claimed and continues on the others.
+    struct LiveGuard(Arc<AtomicUsize>);
+    impl Drop for LiveGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    let _live = LiveGuard(live);
+
     loop {
         if stop.load(Ordering::Acquire) {
             break;
@@ -255,19 +275,22 @@ fn run_fetcher<T>(
         let i = seq.fetch_add(1, Ordering::SeqCst);
         match fetch(i) {
             Some(item) => {
-                // Count it AFTER the (possibly blocking) send returns, so
-                // a fetcher blocked on a full buffer never overcounts —
-                // `ready_len()` stays bounded by `depth`.
+                // Count it BEFORE the (possibly blocking) send so the
+                // gauge is an UPPER bound on occupancy: it can briefly
+                // over-read by the number of fetchers mid-send, but
+                // never under-reads — so the starvation signal can't
+                // false-fire. The hard memory bound is the channel
+                // itself (`sync_channel(depth)`).
+                banked.fetch_add(1, Ordering::SeqCst);
                 if ready_tx.send(item).is_err() {
                     // The buffer was disconnected (preloader dropped).
+                    banked.fetch_sub(1, Ordering::SeqCst);
                     break;
                 }
-                banked.fetch_add(1, Ordering::SeqCst);
             }
             None => break, // source exhausted
         }
     }
-    live.fetch_sub(1, Ordering::SeqCst);
 }
 
 // -----------------------------------------------------------------------------
@@ -288,6 +311,10 @@ pub struct PreloadStrand<T> {
     burst: usize,
     low_water: usize,
     starved: bool,
+    /// The `ready` value at the last starvation vibration, so we re-emit
+    /// only when the drought deepens/eases — a true dual of the
+    /// highway's `queued != last_queued` backpressure dedup.
+    last_ready: usize,
     idle: Duration,
 }
 
@@ -361,6 +388,7 @@ impl<T: Send + Clone + 'static> PreloadStrand<T> {
             // Below this much banked, the buffer is "running dry".
             low_water: depth.div_ceil(2).max(1),
             starved: false,
+            last_ready: 0,
             idle: Duration::from_millis(5),
         }
     }
@@ -404,23 +432,25 @@ impl<T: Send + Clone + 'static> Strand for PreloadStrand<T> {
         }
 
         // STARVATION: the buffer is running dry and the source isn't
-        // done — the fetch can't keep up. Let the web feel it, emitting
-        // only on a change so a steady drought doesn't spam the bus.
-        let starved =
-            !self.preloader.is_exhausted() && self.preloader.ready_len() < self.low_water;
-        if starved != self.starved {
-            if starved {
-                bus.publish_static(
-                    SYS_VIBRATION,
-                    Vibration::Starved {
-                        node: self.name.clone(),
-                        ready: self.preloader.ready_len(),
-                        depth: self.preloader.depth(),
-                    },
-                )?;
-            }
-            self.starved = starved;
+        // done — the fetch can't keep up. Snapshot the gauge ONCE so the
+        // decision and the reported value agree, and re-emit when the
+        // drought depth changes (a true dual of the highway's
+        // re-emit-on-change backpressure), so the spider can gauge how
+        // dry it is without a steady drought spamming the bus.
+        let ready = self.preloader.ready_len();
+        let starved = !self.preloader.is_exhausted() && ready < self.low_water;
+        if starved && (!self.starved || ready != self.last_ready) {
+            bus.publish_static(
+                SYS_VIBRATION,
+                Vibration::Starved {
+                    node: self.name.clone(),
+                    ready,
+                    depth: self.preloader.depth(),
+                },
+            )?;
+            self.last_ready = ready;
         }
+        self.starved = starved;
 
         bus.sleep(self.idle);
         Ok(())
@@ -452,7 +482,10 @@ mod tests {
     }
 
     /// The ready-buffer is bounded: with an instant fetch and no
-    /// consumer, occupancy saturates at the depth and never grows.
+    /// consumer, the fetcher blocks on the full channel and occupancy
+    /// never grows. The gauge is an upper bound — it may read `depth`
+    /// plus the one fetcher blocked mid-send (so `depth + 1` for a
+    /// single fetcher), but never more.
     #[test]
     fn buffer_is_bounded() {
         let pre = Preloader::new(4, |_| Some(1u64));
@@ -463,8 +496,8 @@ mod tests {
         }
         thread::sleep(Duration::from_millis(20));
         assert!(
-            pre.ready_len() <= 4,
-            "occupancy must stay bounded by depth, got {}",
+            pre.ready_len() <= 5,
+            "occupancy must stay bounded (depth 4 + 1 fetcher mid-send), got {}",
             pre.ready_len()
         );
     }
@@ -598,5 +631,60 @@ mod tests {
     #[should_panic(expected = "at least one fetch worker")]
     fn zero_workers_panics() {
         let _pre = Preloader::with_workers(4, 0, |_w| |_i| Some(1u64));
+    }
+
+    /// A panicking fetch closure must NOT leave the preloader immortal:
+    /// the worker's `live` count is decremented (via the RAII guard) even
+    /// on unwind, so `is_exhausted()` becomes true. Guards the highest
+    /// review finding.
+    #[test]
+    fn panicking_fetch_marks_exhausted() {
+        // The deliberate panic prints to stderr from the fetch thread;
+        // cargo captures it on success. (We avoid set_hook so as not to
+        // race the process-global panic hook with parallel tests.)
+        let pre = Preloader::new(4, |i| {
+            assert!(i != 2, "deliberate fetch panic for the test");
+            Some(i)
+        });
+        let start = Instant::now();
+        while !pre.is_exhausted() && start.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            pre.is_exhausted(),
+            "a panicking fetcher must still mark the source exhausted"
+        );
+    }
+
+    /// `is_starved` reflects the buffer level against a threshold.
+    #[test]
+    fn is_starved_reflects_buffer() {
+        // A finite, instant source fills the buffer, then runs dry.
+        let pre = Preloader::new(4, |i| if i < 2 { Some(i) } else { None });
+        let start = Instant::now();
+        while pre.ready_len() < 2 && start.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!pre.is_starved(2), "two banked items meet the low-water of 2");
+        // Drain it; now it's below the threshold.
+        while pre.take().is_some() {}
+        assert!(pre.is_starved(2), "an empty buffer is starved");
+    }
+
+    /// `with_burst` builds a working strand; it constructs and reports
+    /// its configured read-ahead depth.
+    #[test]
+    fn with_burst_constructs() {
+        let strand =
+            PreloadStrand::<u64>::with_burst("loader", "out", 6, 2, |i| {
+                if i < 3 {
+                    Some(i)
+                } else {
+                    None
+                }
+            });
+        assert_eq!(strand.name(), "loader");
+        // The read-ahead engine is depth 6 regardless of the burst.
+        assert_eq!(strand.preloader.depth(), 6);
     }
 }

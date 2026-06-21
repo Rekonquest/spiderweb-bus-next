@@ -16,7 +16,7 @@
 //!
 //! The win is real and honest: read-ahead alone can't beat a single
 //! slow fetch (that's the source-rate ceiling), but PARALLEL read-ahead
-//! raises the source rate to feed the parallel layer. ~3–4× faster.
+//! raises the source rate to feed the parallel layer. ~3× in practice.
 
 use highway::HighwayStrand;
 use preload::PreloadStrand;
