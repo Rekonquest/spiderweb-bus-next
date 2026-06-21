@@ -2,7 +2,9 @@
 //! onto a real bus — no `main()` registration list.
 
 use spiderweb::{Bus, BusHandle, Socket, Strand, StrandError};
-use spiderweb_registry::{advertise, advertise_spider, advertised, BusAutoConnect, Role};
+use spiderweb_registry::{
+    advertise, advertise_spider, advertised, BusAutoConnect, Role, StrandAdvert,
+};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
@@ -66,17 +68,25 @@ fn advertised_set_is_collected() {
     assert!(names.contains("auto-src"), "auto-src advertised");
     assert!(names.contains("auto-snk"), "auto-snk advertised");
     assert!(names.contains("auto-spider"), "spider advertised");
+    // Pin cardinality so an accidentally added/removed advert fails loudly.
+    assert_eq!(
+        advertised().filter(|a| a.role == Role::Strand).count(),
+        2,
+        "exactly two strands advertised"
+    );
     assert_eq!(
         advertised().filter(|a| a.role == Role::Spider).count(),
         1,
         "exactly one spider advertised"
     );
+    assert_eq!(advertised().count(), 3, "no extra or missing adverts");
 }
 
 #[test]
 fn auto_connect_starts_advertised_strands() {
     let mut bus = Bus::open();
-    bus.auto_connect();
+    // The loud variant: panics if any of these weren't advertised.
+    bus.auto_connect_expecting(&["auto-src", "auto-snk"]);
     bus.run_until(Some(Duration::from_millis(400)));
 
     assert!(
@@ -87,4 +97,42 @@ fn auto_connect_starts_advertised_strands() {
         SNK_GOT.load(Ordering::SeqCst) > 0,
         "the advertised sink should have received the source's message — connected by type alone"
     );
+}
+
+/// Each `auto_connect` builds a FRESH strand instance (so a crashed
+/// strand can be restarted from the same advert). Two factory calls must
+/// produce distinct heap allocations.
+#[test]
+fn factory_yields_independent_instances() {
+    let adv = advertised().find(|a| a.name == "auto-src").unwrap();
+    let s1 = (adv.factory)();
+    let s2 = (adv.factory)();
+    let p1 = (&*s1 as *const dyn Strand) as *const ();
+    let p2 = (&*s2 as *const dyn Strand) as *const ();
+    assert_ne!(p1, p2, "each factory call must build a fresh strand, not a shared one");
+}
+
+/// Two advertised spiders must panic — the at-most-one rule holds through
+/// auto-connect. Driven via the explicit-advert seam so it doesn't touch
+/// the process-global slice.
+#[test]
+#[should_panic(expected = "register_spider called twice")]
+fn two_advertised_spiders_panic() {
+    fn make_spider() -> Box<dyn Strand> {
+        Box::new(spider::Spider::new())
+    }
+    let adverts = [
+        StrandAdvert {
+            name: "s1",
+            factory: make_spider,
+            role: Role::Spider,
+        },
+        StrandAdvert {
+            name: "s2",
+            factory: make_spider,
+            role: Role::Spider,
+        },
+    ];
+    let mut bus = Bus::open();
+    bus.auto_connect_from(&adverts);
 }

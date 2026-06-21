@@ -248,11 +248,14 @@ std-only and dependency-free — `inventory` is quarantined here):
 - Doctrine fit: the advert is a self-advertisement (capability), the
   registry is plumbing, the spider orchestrates the advertised set over
   the unchanged `sys.lifecycle` stream.
-- **Honest caveat (documented loudly):** still a Cargo dependency + a
-  `use crate as _;` link anchor per strand — not disk discovery; true
-  no-recompile drop-in needs dlopen (v2). `auto_connect` prints the
-  collected count + names so a missing advert is obvious.
-- 2 tests (collected-set, auto-connect-runs); all 51 prior tests
+- **Honest caveat (documented loudly):** not disk discovery. The Cargo
+  dependency is necessary but NOT sufficient — the load-bearing part is
+  the `use crate as _;` anchor (an unreferenced dependency gets
+  dead-stripped, advert and all). `auto_connect` logs count+names to
+  stderr; `auto_connect_expecting(&[…])` panics loudly on a missing
+  advert. True no-recompile drop-in needs dlopen (v2).
+- Tests: collected-set cardinality, auto-connect-runs, factory-freshness,
+  two-spiders-panic, and a cross-crate linker test. All 51 prior tests
   unchanged.
 
 ### Still to build for v1.3

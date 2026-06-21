@@ -353,12 +353,15 @@ gains *zero* dependencies and stays `forbid(unsafe_code)`. Auto-connect
 and manual `register` coexist; nothing existing changes.
 
 **Honest caveat.** This is not drop-a-file-on-disk discovery. The binary
-must still list each strand crate as a Cargo **dependency** and keep it
-linked (a `use crate as _;` anchor), because the linker can dead-strip an
-advert from a crate it otherwise never references — `auto_connect` prints
-the collected count + names so a missing one is obvious. True
-no-recompile drop-in needs dynamic loading (dlopen), a v2 step that would
-cross the std-only / unsafe line.
+must depend on each strand crate *and reference it*. The Cargo dependency
+is **necessary but not sufficient** — the **load-bearing part is the
+anchor** (`use crate as _;`): a crate that is only a dependency, with no
+symbol referenced, gets dead-stripped by the linker, advert and all
+(compiles, runs, exits 0, strand silently absent). `auto_connect` prints
+the collected count + names to stderr, and `auto_connect_expecting(&[…])`
+turns a missing advert into a loud panic. True no-recompile drop-in needs
+dynamic loading (dlopen), a v2 step that would cross the std-only / unsafe
+line.
 
 ### webctl (the CLI)
 
