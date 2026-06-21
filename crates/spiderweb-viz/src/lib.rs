@@ -26,6 +26,7 @@ pub fn scene_json(snap: &FabricSnapshot) -> String {
     let nodes: Vec<String> = snap
         .positions
         .iter()
+        .filter(|(_, p)| finite(p))
         .map(|(n, p)| {
             format!(
                 "{{\"name\":{},\"x\":{},\"y\":{},\"z\":{}}}",
@@ -45,6 +46,7 @@ pub fn scene_json(snap: &FabricSnapshot) -> String {
                 .direction
                 .iter()
                 .filter_map(|n| snap.position(n))
+                .filter(finite)
                 .map(|p| format!("[{},{},{}]", p.x, p.y, p.z))
                 .collect();
             format!("{{\"id\":{},\"polyline\":[{}]}}", t.id, pts.join(","))
@@ -55,7 +57,7 @@ pub fn scene_json(snap: &FabricSnapshot) -> String {
         .intersections
         .iter()
         .filter_map(|i| {
-            snap.position(&i.node).map(|p| {
+            snap.position(&i.node).filter(finite).map(|p| {
                 let tids: Vec<String> = i.threads.iter().map(|t| t.to_string()).collect();
                 format!(
                     "{{\"node\":{},\"x\":{},\"y\":{},\"z\":{},\"threads\":[{}]}}",
@@ -77,6 +79,13 @@ pub fn scene_json(snap: &FabricSnapshot) -> String {
     )
 }
 
+/// A position is renderable only if every coordinate is finite — a
+/// non-finite one would emit `NaN`/`inf`, which is not valid JSON. We
+/// skip it (like an unplaced node) rather than corrupt the whole scene.
+fn finite(p: &spiderweb::Position) -> bool {
+    p.x.is_finite() && p.y.is_finite() && p.z.is_finite()
+}
+
 /// Minimal JSON string escaping (the node names are simple, but be safe).
 fn json_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -96,7 +105,7 @@ fn json_str(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spiderweb::{Bus, Position};
+    use spiderweb::{Bus, FabricSnapshot, Position};
 
     #[test]
     fn scene_has_nodes_and_is_valid_shape() {
@@ -109,5 +118,29 @@ mod tests {
         assert!(json.contains("\"name\":\"a\""));
         assert!(json.contains("\"name\":\"b\""));
         assert!(json.starts_with('{') && json.ends_with('}'));
+    }
+
+    /// An empty fabric exports a fixed, valid empty scene.
+    #[test]
+    fn empty_snapshot_is_valid_json() {
+        let json = scene_json(&Bus::open().fabric_snapshot());
+        assert_eq!(json, "{\"nodes\":[],\"threads\":[],\"intersections\":[]}");
+    }
+
+    /// A non-finite coordinate (in a hand-built snapshot) is skipped, never
+    /// emitted as the invalid JSON tokens `NaN`/`inf`.
+    #[test]
+    fn non_finite_position_is_skipped_not_emitted() {
+        let snap = FabricSnapshot {
+            positions: vec![
+                ("ok".to_string(), Position::new(1.0, 2.0, 3.0)),
+                ("bad".to_string(), Position::new(f64::NAN, f64::INFINITY, 0.0)),
+            ],
+            ..Default::default()
+        };
+        let json = scene_json(&snap);
+        assert!(json.contains("\"name\":\"ok\""), "finite node kept");
+        assert!(!json.contains("bad"), "non-finite node dropped");
+        assert!(!json.contains("NaN") && !json.contains("inf"), "no invalid JSON tokens");
     }
 }

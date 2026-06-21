@@ -249,16 +249,30 @@ impl Position {
 /// and decides how to react — mechanism here, policy there. The decay
 /// kernel ([`attenuation`] = `1/(1+d)`, [`attenuation_within`] = radius
 /// cutoff) is a swappable generator in one primitive slot.
+///
+/// Result is in `[0, 1]`: `1.0` when either position is unknown, in
+/// `(0, 1]` for a finite distance, and `0.0` for an infinite/non-finite
+/// distance (an unreachable node feels nothing). Positions placed via
+/// [`Bus::place`] are guarded finite, so the non-finite case only arises
+/// for hand-built `Position`s.
 pub fn attenuation(origin: Option<Position>, receiver: Option<Position>) -> f64 {
     match (origin, receiver) {
-        (Some(o), Some(r)) => 1.0 / (1.0 + o.distance(r)),
+        (Some(o), Some(r)) => {
+            let d = o.distance(r);
+            if d.is_finite() {
+                1.0 / (1.0 + d)
+            } else {
+                0.0
+            }
+        }
         _ => 1.0,
     }
 }
 
 /// Like [`attenuation`] but with a hard `radius` cutoff: a vibration is
 /// felt nothing (`0.0`) strictly beyond `radius` from its origin — the
-/// edge of the web's reach.
+/// edge of the web's reach. The boundary is inclusive (`d == radius` is
+/// still felt); a non-finite distance reads as beyond reach (`0.0`).
 pub fn attenuation_within(
     origin: Option<Position>,
     receiver: Option<Position>,
@@ -267,10 +281,12 @@ pub fn attenuation_within(
     match (origin, receiver) {
         (Some(o), Some(r)) => {
             let d = o.distance(r);
-            if d > radius {
-                0.0
-            } else {
+            // `d <= radius` is false for NaN, so a non-finite distance
+            // correctly falls to 0.0 (beyond reach) rather than NaN.
+            if d <= radius {
                 1.0 / (1.0 + d)
+            } else {
+                0.0
             }
         }
         _ => 1.0,
@@ -520,18 +536,29 @@ impl Fabric {
     }
 
     fn set_position(&mut self, node: &str, pos: Position) {
-        self.positions.insert(node.to_string(), pos);
+        // Ignore a non-finite position so the fabric never holds NaN/inf:
+        // the node simply stays unplaced (felt at full strength) rather
+        // than poisoning the distance/attenuation/scene math downstream.
+        if pos.x.is_finite() && pos.y.is_finite() && pos.z.is_finite() {
+            self.positions.insert(node.to_string(), pos);
+        }
     }
 
     fn snapshot(&self) -> FabricSnapshot {
+        // Sort every collection so a snapshot is deterministic across
+        // runs (the underlying maps have nondeterministic iteration
+        // order) — golden tests and scene exports stay stable.
+        let mut threads: Vec<Thread> = self.threads.values().cloned().collect();
+        threads.sort_by_key(|t| t.id);
+        let mut intersections: Vec<Intersection> = self.intersections.values().cloned().collect();
+        intersections.sort_by(|a, b| a.node.cmp(&b.node));
+        let mut positions: Vec<(NodeId, Position)> =
+            self.positions.iter().map(|(n, p)| (n.clone(), *p)).collect();
+        positions.sort_by(|a, b| a.0.cmp(&b.0));
         FabricSnapshot {
-            threads: self.threads.values().cloned().collect(),
-            intersections: self.intersections.values().cloned().collect(),
-            positions: self
-                .positions
-                .iter()
-                .map(|(n, p)| (n.clone(), *p))
-                .collect(),
+            threads,
+            intersections,
+            positions,
         }
     }
 }
@@ -3056,6 +3083,34 @@ mod tests {
         // radius cutoff: felt within, nothing beyond.
         assert!(attenuation_within(Some(o), Some(near), 5.0) > 0.0);
         assert_eq!(attenuation_within(Some(o), Some(far), 5.0), 0.0);
+        // boundary is inclusive: at d == radius the vibration is still felt.
+        let edge = Position::new(5.0, 0.0, 0.0); // d == radius == 5
+        assert_eq!(attenuation_within(Some(o), Some(edge), 5.0), 1.0 / 6.0);
+    }
+
+    /// Non-finite coordinates never produce NaN: attenuation reads them as
+    /// unreachable (0.0), and the radius cutoff isn't defeated.
+    #[test]
+    fn attenuation_is_nan_safe() {
+        let o = Position::ORIGIN;
+        let bad = Position::new(f64::NAN, 0.0, 0.0);
+        let inf = Position::new(f64::INFINITY, 0.0, 0.0);
+        assert_eq!(attenuation(Some(o), Some(bad)), 0.0);
+        assert_eq!(attenuation(Some(o), Some(inf)), 0.0);
+        assert_eq!(attenuation_within(Some(o), Some(bad), 5.0), 0.0);
+        assert_eq!(attenuation_within(Some(o), Some(inf), 5.0), 0.0);
+    }
+
+    /// `place` ignores a non-finite position — the node stays unplaced
+    /// rather than poisoning the fabric with NaN.
+    #[test]
+    fn place_ignores_non_finite() {
+        let mut bus = Bus::open();
+        bus.place("ok", Position::new(1.0, 2.0, 3.0));
+        bus.place("bad", Position::new(f64::NAN, 0.0, 0.0));
+        let snap = bus.fabric_snapshot();
+        assert_eq!(snap.position("ok"), Some(Position::new(1.0, 2.0, 3.0)));
+        assert_eq!(snap.position("bad"), None, "a non-finite placement is ignored");
     }
 
     /// The fabric records a placed position; `place` overrides an earlier
