@@ -27,8 +27,19 @@
 //!   trust boundary the bus must *earn*, not assert.
 //! - **No cross-machine causality**: the lineage `Tag` does not cross the wire
 //!   (Interval Tree Clocks are the follow-up).
-//! - The listener's blocking-accept reader thread is not torn down on bus
-//!   shutdown (a `Drop`-based stop is a follow-up); harmless for tests/demos.
+//! - The listener's reader thread, when blocked in `accept()` with no peer
+//!   connected, is not torn down on bus shutdown (a `Drop`-based stop is a
+//!   follow-up); harmless for tests/demos. (When it is reading or blocked
+//!   sending to a full channel, it exits cleanly once the strand is dropped.)
+//!
+//! ## Bounded by construction (the untrusted-input guards)
+//! Frame headers are capped (`MAX_TAG`, `MAX_PAYLOAD`) so a hostile length
+//! can't trigger a huge alloc; the reader→strand handoff is a **bounded**
+//! `sync_channel` (`EDGE_CHANNEL_CAP`), so a flooding peer hits backpressure
+//! (blocked `send` → unread socket → TCP flow control) rather than unbounded
+//! memory growth; and a read timeout (`READ_TIMEOUT_SECS`) caps a mid-frame
+//! stall. The peer is still *trusted* (no auth) — these guards keep a buggy or
+//! noisy peer from degrading the host, not a determined attacker.
 
 use spiderweb::{BusHandle, Socket, Strand, StrandError};
 use std::io::{Read, Write};
@@ -46,7 +57,16 @@ type Push = Box<dyn Fn(&mut BusHandle, &[u8]) + Send>;
 
 /// Sanity caps so a corrupt/hostile frame header can't trigger a huge alloc.
 const MAX_TAG: usize = 1024;
-const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
+const MAX_PAYLOAD: usize = 4 * 1024 * 1024;
+/// Bound the reader-thread -> strand handoff so a flooding peer can't grow it
+/// without limit: when full, the reader's `send` blocks, which stops draining
+/// the socket, which backpressures the peer via TCP flow control. Worst-case
+/// buffered bytes ≈ `EDGE_CHANNEL_CAP * MAX_PAYLOAD`.
+const EDGE_CHANNEL_CAP: usize = 256;
+/// A peer that opens a connection then stalls mid-frame must not block the
+/// reader thread forever; a generous read timeout caps the stall and drops the
+/// connection (the peer can reconnect).
+const READ_TIMEOUT_SECS: u64 = 30;
 
 /// A peer link configuration: which types bridge across the wire and how each
 /// serializes. Build it the same way on both ends, then call [`Edge::sender`]
@@ -128,7 +148,8 @@ impl Edge {
     pub fn listener(self, name: &'static str, addr: impl std::net::ToSocketAddrs) -> std::io::Result<EdgeListener> {
         let listener = TcpListener::bind(addr)?;
         let local_addr = listener.local_addr()?;
-        let (tx, rx) = mpsc::channel::<(String, Vec<u8>)>();
+        // Bounded: see EDGE_CHANNEL_CAP — backpressure, not unbounded growth.
+        let (tx, rx) = mpsc::sync_channel::<(String, Vec<u8>)>(EDGE_CHANNEL_CAP);
         thread::spawn(move || reader_loop(listener, tx));
 
         let mut socks = Vec::new();
@@ -239,14 +260,18 @@ impl Strand for EdgeListener {
 
 /// Accept connections and stream their frames to `tx`. Re-accepts after a peer
 /// disconnects; exits when the receiver (the strand) is dropped.
-fn reader_loop(listener: TcpListener, tx: mpsc::Sender<(String, Vec<u8>)>) {
+fn reader_loop(listener: TcpListener, tx: mpsc::SyncSender<(String, Vec<u8>)>) {
     for conn in listener.incoming() {
         let mut stream = match conn {
             Ok(s) => s,
             Err(_) => continue,
         };
-        // Read frames until EOF/error, then fall through to accept the next
-        // connection.
+        // Cap a mid-frame stall (slow-loris) so one wedged connection can't
+        // block the reader (and thus the listener) forever.
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)));
+        // Read frames until EOF/error/timeout, then fall through to accept the
+        // next connection. `send` blocks when the bounded channel is full
+        // (backpressure) and returns Err when the strand is dropped (stop).
         while let Ok(frame) = read_frame(&mut stream) {
             if tx.send(frame).is_err() {
                 return; // strand dropped: stop.
