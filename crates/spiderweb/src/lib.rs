@@ -342,15 +342,16 @@ impl FabricSnapshot {
     ///
     /// An edge `(from, to)` exists once at least one message has been
     /// delivered across it, and its **conductance** is that real
-    /// per-delivery count ([`FabricSnapshot::edge_traffic`]) — incremented
-    /// as each message actually crosses the edge. So it is honest observed
-    /// traffic: one delivery weighs `1.0`, a worn path weighs more, and a
-    /// Stay fan-out increments each downstream edge once **without inflating
-    /// the upstream edge** (the shared thread prefix is not re-counted per
-    /// sibling). Counts are message deliveries, **not bytes** — a
-    /// single-process payload is a typed value with no serialized size (a
-    /// real wall, not a placeholder); byte/bandwidth-weighted conductance
-    /// arrives with edge transport as a drop-in swap of this same count.
+    /// per-delivery count ([`FabricSnapshot::edge_traffic`]) — counted at
+    /// the physical publisher->subscriber hop. So it is honest observed
+    /// traffic: one delivery weighs `1.0`, a worn path weighs more, a
+    /// fan-out counts each downstream edge once **without inflating the
+    /// upstream edge**, and it stays correct under every transfer policy
+    /// (`HopTo`/`MergeAll` re-parent the lineage tag, never the physical
+    /// hop). Counts are message deliveries, **not bytes** — a single-process
+    /// payload is a typed value with no serialized size (a real wall, not a
+    /// placeholder); byte/bandwidth-weighted conductance arrives with edge
+    /// transport as a drop-in swap of this same count.
     ///
     /// The edges are **directed** (faithful to message flow); a generator
     /// that wants a symmetric `A` folds reciprocal pairs as *it* decides
@@ -444,17 +445,19 @@ struct Fabric {
     /// the routing path; set via [`Bus::place`] or an advertised position.
     positions: HashMap<NodeId, Position>,
     /// Per-edge traffic: how many messages have actually been delivered
-    /// across each directed edge `(from, to)`, incremented in
-    /// [`Fabric::record_arrival`] as lineages flow. This is the real
-    /// observed-traffic weight behind [`FabricSnapshot::adjacency`]'s
-    /// conductance — counted at delivery, so a fan-out increments each
-    /// downstream edge once and never inflates the upstream edge (the
-    /// shared prefix is not re-counted per sibling thread). Counts are
-    /// message deliveries, **not bytes**: in a single-process bus a payload
-    /// is a typed value with no serialized size — a real wall, not a
-    /// placeholder; byte/bandwidth-weighted conductance arrives with edge
-    /// transport as a drop-in swap of this same count. Cumulative (survives
-    /// thread eviction) and, like the other node-keyed indices, bounded in
+    /// across each directed edge `(from, to)`, incremented by
+    /// [`Fabric::record_traffic`] from [`Kernel::deliver`] at the PHYSICAL
+    /// publisher->subscriber hop. This is the real observed-traffic weight
+    /// behind [`FabricSnapshot::adjacency`]'s conductance. Counting the
+    /// physical hop (not a thread's lineage) keeps it correct under every
+    /// transfer policy — `HopTo`/`MergeAll` re-parent the tag, never the
+    /// delivery — and a fan-out naturally counts each downstream edge once
+    /// without inflating the upstream edge. Counts are message deliveries,
+    /// **not bytes**: in a single-process bus a payload is a typed value
+    /// with no serialized size — a real wall, not a placeholder;
+    /// byte/bandwidth-weighted conductance arrives with edge transport as a
+    /// drop-in swap of this same count. Cumulative (survives thread
+    /// eviction) and, like the other node-keyed indices, bounded in
     /// practice by the live strand topology.
     edge_traffic: HashMap<(NodeId, NodeId), u64>,
     next_thread: ThreadId,
@@ -528,6 +531,25 @@ impl Fabric {
         }
     }
 
+    /// Count one physical message delivery across the edge `from -> to`.
+    /// This is the honest per-edge traffic weight behind
+    /// [`FabricSnapshot::adjacency`]'s conductance. It is recorded at the
+    /// PHYSICAL deliver site (publisher -> subscriber, see
+    /// [`Kernel::deliver`]) rather than from a thread's lineage, so it is
+    /// correct under every transfer policy: a tag re-parented by `HopTo`
+    /// or fused by `MergeAll` changes the *lineage*, never the physical
+    /// hop a message actually took. A self-delivery (`from == to`) is not
+    /// a traffic edge and is skipped, keeping the adjacency diagonal zero.
+    fn record_traffic(&mut self, from: &str, to: &str) {
+        if from == to {
+            return;
+        }
+        *self
+            .edge_traffic
+            .entry((from.to_string(), to.to_string()))
+            .or_insert(0) += 1;
+    }
+
     /// Record that thread `tid` was delivered to `node`. Grows the
     /// thread's path (deduping consecutive repeats) and detects an
     /// intersection when `node` first sees a second distinct thread.
@@ -535,20 +557,6 @@ impl Fabric {
     /// dropping the fabric lock.
     fn record_arrival(&mut self, tid: ThreadId, node: &str) -> Vec<LifecycleEvent> {
         let mut events = Vec::new();
-
-        // The edge this delivery actually traversed: the thread's previous
-        // node -> this node. Count it once, at delivery, as real per-edge
-        // traffic. Computed before the push (and as a separate borrow) so a
-        // fan-out increments each downstream edge once and never re-counts
-        // the shared prefix per sibling thread.
-        let traversed = self.threads.get(&tid).and_then(|t| match t.direction.last() {
-            Some(last) if last == node => None, // consecutive repeat: no new edge
-            Some(last) => Some(last.clone()),
-            None => None,
-        });
-        if let Some(prev) = traversed {
-            *self.edge_traffic.entry((prev, node.to_string())).or_insert(0) += 1;
-        }
 
         if let Some(t) = self.threads.get_mut(&tid) {
             if t.direction.last().map(String::as_str) != Some(node) {
@@ -1403,6 +1411,23 @@ impl Kernel {
                     sub.name
                 );
                 let _ = returned;
+            }
+        }
+
+        // Record the physical traffic edges this delivery crossed:
+        // `from_name -> each subscriber`. Counted HERE, at the physical
+        // deliver site, not from a thread's lineage — so the per-edge
+        // conductance follows the real publisher->subscriber hop and stays
+        // correct under HopTo/MergeAll (which re-parent the tag, never the
+        // physical delivery). Reserved sys.* sockets carry no work traffic.
+        // (Edge case: a buffer-replay to a late subscriber happens in
+        // `subscribe`, which no longer knows the original sender, so those
+        // replays are not counted — a minor under-count on relative
+        // conductance, not a corruption.)
+        if !reserved && !snapshot.is_empty() {
+            let mut fabric = self.fabric.lock().unwrap();
+            for sub in &snapshot {
+                fabric.record_traffic(from_name, &sub.name);
             }
         }
 
@@ -3498,6 +3523,63 @@ mod tests {
         assert_eq!(w("relay", "sink-a"), Some(1.0), "edges: {:?}", adj.edges);
         assert_eq!(w("relay", "sink-b"), Some(1.0), "edges: {:?}", adj.edges);
         assert_eq!(w("relay", "sink-c"), Some(1.0), "edges: {:?}", adj.edges);
+    }
+
+    /// Counting the PHYSICAL hop (not the lineage tag) keeps conductance
+    /// correct under MergeAll: two sources fuse at `N`, so `N->sink` carries
+    /// two real deliveries and weighs 2 — even though MergeAll fuses both
+    /// lineages onto one thread whose tail would otherwise eat the second
+    /// delivery. (The lineage-based counter undercounted this trunk to 1.)
+    #[test]
+    fn adjacency_conductance_correct_under_mergeall() {
+        let snap = run_transfer_flow(Some(TransferPolicy::MergeAll));
+        let adj = snap.adjacency();
+        let w = |from: &str, to: &str| {
+            adj.edges
+                .iter()
+                .find(|e| e.from == from && e.to == to)
+                .map(|e| e.conductance)
+        };
+        assert_eq!(w("s1", "N"), Some(1.0), "edges: {:?}", adj.edges);
+        assert_eq!(w("s2", "N"), Some(1.0), "edges: {:?}", adj.edges);
+        assert_eq!(
+            w("N", "sink"),
+            Some(2.0),
+            "the fused trunk must count BOTH physical deliveries, edges: {:?}",
+            adj.edges
+        );
+    }
+
+    /// Under HopTo (which re-parents the lineage tag onto another thread),
+    /// conductance still reflects only PHYSICAL hops: no phantom edges from
+    /// the re-parented lineage, and the real deliveries are counted. (The
+    /// lineage-based counter fabricated edges no message crossed and dropped
+    /// the real ones.)
+    #[test]
+    fn adjacency_conductance_correct_under_hopto() {
+        let snap = run_transfer_flow(Some(TransferPolicy::HopTo(0)));
+        let adj = snap.adjacency();
+        let w = |from: &str, to: &str| {
+            adj.edges
+                .iter()
+                .find(|e| e.from == from && e.to == to)
+                .map(|e| e.conductance)
+        };
+        assert_eq!(w("s1", "N"), Some(1.0), "edges: {:?}", adj.edges);
+        assert_eq!(w("s2", "N"), Some(1.0), "edges: {:?}", adj.edges);
+        assert_eq!(w("N", "sink"), Some(2.0), "edges: {:?}", adj.edges);
+        // Every edge is one of the three real physical hops — no phantoms.
+        for e in &adj.edges {
+            assert!(
+                matches!(
+                    (e.from.as_str(), e.to.as_str()),
+                    ("s1", "N") | ("s2", "N") | ("N", "sink")
+                ),
+                "unexpected (phantom) edge {:?} in {:?}",
+                e,
+                adj.edges
+            );
+        }
     }
 
     // ----- Strand-name collision detection (H4) ---------------------------
