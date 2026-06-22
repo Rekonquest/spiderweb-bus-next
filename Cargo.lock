@@ -230,6 +230,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "spiderweb-edge"
+version = "0.1.0"
+dependencies = [
+ "spiderweb",
+]
+
+[[package]]
 name = "spiderweb-registry"
 version = "0.1.0"
 dependencies = [
