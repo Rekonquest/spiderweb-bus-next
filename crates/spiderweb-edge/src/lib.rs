@@ -19,9 +19,19 @@
 //! Length-prefixed, big-endian: `[u32 tag_len][tag bytes][u32 payload_len][payload]`.
 //!
 //! ## Honest MVP scope (these are the *next* hardened layers, not done here)
-//! - **At-most-once** delivery: a frame produced while the peer is disconnected
-//!   is dropped (no retransmit/queue). Reliability (sliding-window RLNC /
-//!   RaptorQ) is a follow-up.
+//! - **Bounded reliable delivery** (was at-most-once): each frame carries a
+//!   monotonic sequence number and is held in a bounded sender ring
+//!   (`RING_CAP`); on (re)connect the sender replays the ring so the peer
+//!   catches up on anything missed during a disconnect (or before the first
+//!   connect), and the receiver dedups by sequence — so a recovered frame is
+//!   never delivered twice. This recovers losses up to `RING_CAP` frames of
+//!   disconnect. **Honest limits:** beyond the ring bound, frames are lost; it
+//!   assumes ONE long-lived sender whose sequence is monotonic across
+//!   reconnects (a sender *restart* resets the sequence and would be dedup'd
+//!   until it passes the receiver's high-water mark — a session id fixes this);
+//!   and there is no end-to-end ACK, so the ring frees by age, not by receiver
+//!   progress. Unbounded reliability with no head-of-line blocking
+//!   (sliding-window RLNC / RaptorQ) is the next tier.
 //! - **No authentication / no encryption**: the wire is plaintext and the peer
 //!   is trusted. Auth (BLS / threshold) + TLS/QUIC are follow-ups — this is the
 //!   trust boundary the bus must *earn*, not assert.
@@ -50,6 +60,7 @@
 
 use spiderweb::{BusHandle, Socket, Strand, StrandError};
 use std::any::TypeId;
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver};
@@ -75,6 +86,10 @@ const EDGE_CHANNEL_CAP: usize = 256;
 /// reader thread forever; a generous read timeout caps the stall and drops the
 /// connection (the peer can reconnect).
 const READ_TIMEOUT_SECS: u64 = 30;
+/// Sender resend ring: how many recent frames are retained for replay on
+/// (re)connect. Recovers losses up to this many frames of disconnect; worst-
+/// case retained bytes ≈ `RING_CAP * MAX_PAYLOAD`.
+const RING_CAP: usize = 256;
 
 /// A peer link configuration: which types bridge across the wire and how each
 /// serializes. Build it the same way on both ends, then call [`Edge::sender`]
@@ -175,6 +190,8 @@ impl Edge {
             stream: None,
             socks,
             pulls,
+            next_seq: 1,
+            ring: VecDeque::new(),
         }
     }
 
@@ -186,7 +203,7 @@ impl Edge {
         let listener = TcpListener::bind(addr)?;
         let local_addr = listener.local_addr()?;
         // Bounded: see EDGE_CHANNEL_CAP — backpressure, not unbounded growth.
-        let (tx, rx) = mpsc::sync_channel::<(String, Vec<u8>)>(EDGE_CHANNEL_CAP);
+        let (tx, rx) = mpsc::sync_channel::<(u64, String, Vec<u8>)>(EDGE_CHANNEL_CAP);
         thread::spawn(move || reader_loop(listener, tx));
 
         let mut socks = Vec::new();
@@ -204,6 +221,7 @@ impl Edge {
             socks,
             pushes,
             local_addr,
+            delivered: 0,
         })
     }
 }
@@ -215,6 +233,10 @@ pub struct EdgeSender {
     stream: Option<TcpStream>,
     socks: Vec<Socket>,
     pulls: Vec<(&'static str, Pull)>,
+    /// Next sequence to assign (monotonic; starts at 1, so 0 means "none yet").
+    next_seq: u64,
+    /// Bounded resend ring of recent frames, replayed on (re)connect.
+    ring: VecDeque<(u64, &'static str, Vec<u8>)>,
 }
 
 impl Strand for EdgeSender {
@@ -228,30 +250,46 @@ impl Strand for EdgeSender {
         &[]
     }
     fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
-        if self.stream.is_none() {
-            self.stream = TcpStream::connect(&self.peer).ok();
-        }
-
-        // Pull every bridged type off the local bus first (borrows `pulls`),
-        // then write (borrows `stream`).
-        let mut frames: Vec<(&'static str, Vec<u8>)> = Vec::new();
+        // 1. Pull fresh frames off the local bus, assign monotonic seqs, and
+        //    append to the bounded resend ring.
+        let mut fresh: Vec<(u64, &'static str, Vec<u8>)> = Vec::new();
         for (tag, pull) in &self.pulls {
             for payload in pull(bus) {
-                frames.push((*tag, payload));
+                let seq = self.next_seq;
+                self.next_seq += 1;
+                fresh.push((seq, *tag, payload));
             }
         }
-        if !frames.is_empty() {
-            if let Some(stream) = self.stream.as_mut() {
-                for (tag, payload) in &frames {
-                    if write_frame(stream, tag, payload).is_err() {
-                        // Peer dropped: reconnect next tick. Frames pulled
-                        // this tick are lost (at-most-once MVP).
-                        self.stream = None;
-                        break;
-                    }
-                }
+        for (seq, tag, payload) in &fresh {
+            self.ring.push_back((*seq, *tag, payload.clone()));
+        }
+        while self.ring.len() > RING_CAP {
+            self.ring.pop_front();
+        }
+
+        // 2. (Re)connect. On a FRESH connection, replay the whole ring so the
+        //    peer catches up on anything it missed during a disconnect (or
+        //    before the first connect); it dedups by seq. On a live connection,
+        //    send only this tick's fresh frames.
+        let reconnecting = self.stream.is_none();
+        if reconnecting {
+            self.stream = TcpStream::connect(&self.peer).ok();
+        }
+        if let Some(stream) = self.stream.as_mut() {
+            let result = if reconnecting {
+                self.ring
+                    .iter()
+                    .try_for_each(|(seq, tag, payload)| write_frame(stream, *seq, tag, payload))
+            } else {
+                fresh
+                    .iter()
+                    .try_for_each(|(seq, tag, payload)| write_frame(stream, *seq, tag, payload))
+            };
+            if result.is_err() {
+                // Peer dropped: reconnect next tick and replay then. Nothing is
+                // lost beyond the ring's bound.
+                self.stream = None;
             }
-            // Not connected => frames are dropped (at-most-once MVP).
         }
         bus.sleep(Duration::from_millis(5));
         Ok(())
@@ -261,10 +299,14 @@ impl Strand for EdgeSender {
 /// Consuming-side bridge strand (wire -> local bus). See [`Edge::listener`].
 pub struct EdgeListener {
     name: &'static str,
-    rx: Receiver<(String, Vec<u8>)>,
+    rx: Receiver<(u64, String, Vec<u8>)>,
     socks: Vec<Socket>,
     pushes: Vec<(&'static str, Push)>,
     local_addr: SocketAddr,
+    /// High-water mark of delivered sequence numbers. A reconnect replay
+    /// re-sends already-seen seqs; we skip any `seq <= delivered` so a recovered
+    /// frame is never delivered twice.
+    delivered: u64,
 }
 
 impl EdgeListener {
@@ -285,7 +327,13 @@ impl Strand for EdgeListener {
         &self.socks
     }
     fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
-        for (tag, payload) in self.rx.try_iter() {
+        for (seq, tag, payload) in self.rx.try_iter() {
+            // Dedup: seqs are monotonic from the sender, so a reconnect replay
+            // re-sends already-seen seqs — skip them.
+            if seq <= self.delivered {
+                continue;
+            }
+            self.delivered = seq;
             for (t, push) in &self.pushes {
                 if *t == tag {
                     push(bus, &payload);
@@ -300,7 +348,7 @@ impl Strand for EdgeListener {
 
 /// Accept connections and stream their frames to `tx`. Re-accepts after a peer
 /// disconnects; exits when the receiver (the strand) is dropped.
-fn reader_loop(listener: TcpListener, tx: mpsc::SyncSender<(String, Vec<u8>)>) {
+fn reader_loop(listener: TcpListener, tx: mpsc::SyncSender<(u64, String, Vec<u8>)>) {
     for conn in listener.incoming() {
         let mut stream = match conn {
             Ok(s) => s,
@@ -320,7 +368,8 @@ fn reader_loop(listener: TcpListener, tx: mpsc::SyncSender<(String, Vec<u8>)>) {
     }
 }
 
-fn write_frame(stream: &mut TcpStream, tag: &str, payload: &[u8]) -> std::io::Result<()> {
+fn write_frame(stream: &mut TcpStream, seq: u64, tag: &str, payload: &[u8]) -> std::io::Result<()> {
+    stream.write_all(&seq.to_be_bytes())?;
     let tag_b = tag.as_bytes();
     stream.write_all(&(tag_b.len() as u32).to_be_bytes())?;
     stream.write_all(tag_b)?;
@@ -329,8 +378,11 @@ fn write_frame(stream: &mut TcpStream, tag: &str, payload: &[u8]) -> std::io::Re
     stream.flush()
 }
 
-fn read_frame(stream: &mut TcpStream) -> std::io::Result<(String, Vec<u8>)> {
+fn read_frame(stream: &mut TcpStream) -> std::io::Result<(u64, String, Vec<u8>)> {
     use std::io::{Error, ErrorKind};
+    let mut seq8 = [0u8; 8];
+    stream.read_exact(&mut seq8)?;
+    let seq = u64::from_be_bytes(seq8);
     let mut len4 = [0u8; 4];
     stream.read_exact(&mut len4)?;
     let tag_len = u32::from_be_bytes(len4) as usize;
@@ -348,7 +400,7 @@ fn read_frame(stream: &mut TcpStream) -> std::io::Result<(String, Vec<u8>)> {
     }
     let mut payload = vec![0u8; payload_len];
     stream.read_exact(&mut payload)?;
-    Ok((tag, payload))
+    Ok((seq, tag, payload))
 }
 
 #[cfg(test)]
@@ -560,5 +612,82 @@ mod tests {
         assert!(!a.iter().any(|s| s == "msg-b"), "wire.a must NOT receive msg-b (cross-tag leak), got {:?}", *a);
         assert!(b.iter().any(|s| s == "msg-b"), "wire.b should receive msg-b, got {:?}", *b);
         assert!(!b.iter().any(|s| s == "msg-a"), "wire.b must NOT receive msg-a (cross-tag leak), got {:?}", *b);
+    }
+
+    /// Publishes 10 distinct messages, once each.
+    struct CountSource {
+        next: u32,
+    }
+    impl Strand for CountSource {
+        fn name(&self) -> &str {
+            "count-source"
+        }
+        fn inputs(&self) -> &[Socket] {
+            &[]
+        }
+        fn outputs(&self) -> &[Socket] {
+            const S: Socket = Socket::new::<String>("wire.count");
+            std::slice::from_ref(&S)
+        }
+        fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+            if self.next < 10 {
+                bus.publish("wire.count", format!("msg-{}", self.next))?;
+                self.next += 1;
+            }
+            bus.sleep(Duration::from_millis(20));
+            Ok(())
+        }
+    }
+
+    /// EVERY distinct message published on bus A arrives on bus B exactly once —
+    /// none dropped by connect timing, none duplicated. Each is published a
+    /// single time; the bounded resend ring + replay-on-connect recovers any
+    /// produced before the sender connected, and seq-dedup prevents duplicates.
+    /// (Under the old at-most-once MVP, messages published before the sender
+    /// connected were silently lost.)
+    #[test]
+    fn all_published_messages_arrive_exactly_once() {
+        let sink = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        let listener = Edge::new()
+            .bridge::<String>("count", "wire.count", enc, dec)
+            .listener("edge-in", "127.0.0.1:0")
+            .expect("bind listener");
+        let port = listener.local_addr().port();
+
+        let sink_b = sink.clone();
+        let recv_bus = thread::spawn(move || {
+            register_clone_type::<String>();
+            let mut bus = Bus::open();
+            bus.register(listener);
+            bus.register(SocketCollector::new("col", "wire.count", sink_b));
+            bus.run_until(Some(Duration::from_millis(900)));
+        });
+
+        let send_bus = thread::spawn(move || {
+            register_clone_type::<String>();
+            let mut bus = Bus::open();
+            bus.register(CountSource { next: 0 });
+            bus.register(
+                Edge::new()
+                    .bridge::<String>("count", "wire.count", enc, dec)
+                    .sender("edge-out", format!("127.0.0.1:{port}")),
+            );
+            bus.run_until(Some(Duration::from_millis(900)));
+        });
+
+        send_bus.join().unwrap();
+        recv_bus.join().unwrap();
+
+        let got = sink.lock().unwrap();
+        for i in 0..10 {
+            let m = format!("msg-{i}");
+            assert_eq!(
+                got.iter().filter(|s| **s == m).count(),
+                1,
+                "{m} should arrive exactly once; got {:?}",
+                *got
+            );
+        }
     }
 }
