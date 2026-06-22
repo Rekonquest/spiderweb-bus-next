@@ -27,9 +27,12 @@
 //!   never delivered twice. This recovers losses up to `RING_CAP` frames of
 //!   disconnect. **Honest limits:** beyond the ring bound, frames are lost; it
 //!   assumes ONE long-lived sender whose sequence is monotonic across
-//!   reconnects (a sender *restart* resets the sequence and would be dedup'd
-//!   until it passes the receiver's high-water mark — a session id fixes this);
-//!   and there is no end-to-end ACK, so the ring frees by age, not by receiver
+//!   reconnects. A sender *restart* (new process, seq reset to 1) against a
+//!   still-running listener is NOT a brief hiccup: EVERY frame from the
+//!   restarted sender is silently dropped until its seq climbs past the
+//!   receiver's high-water mark — potentially thousands of messages of
+//!   blackout. Fixing that needs a per-session id keyed dedup (the next tier).
+//!   And there is no end-to-end ACK, so the ring frees by age, not by receiver
 //!   progress. Unbounded reliability with no head-of-line blocking
 //!   (sliding-window RLNC / RaptorQ) is the next tier.
 //! - **No authentication / no encryption**: the wire is plaintext and the peer
@@ -383,6 +386,10 @@ fn read_frame(stream: &mut TcpStream) -> std::io::Result<(u64, String, Vec<u8>)>
     let mut seq8 = [0u8; 8];
     stream.read_exact(&mut seq8)?;
     let seq = u64::from_be_bytes(seq8);
+    if seq == 0 {
+        // 0 is the reserved "none yet" sentinel; a real frame's seq is >= 1.
+        return Err(Error::new(ErrorKind::InvalidData, "seq 0 is reserved"));
+    }
     let mut len4 = [0u8; 4];
     stream.read_exact(&mut len4)?;
     let tag_len = u32::from_be_bytes(len4) as usize;
