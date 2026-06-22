@@ -27,10 +27,15 @@
 //!   trust boundary the bus must *earn*, not assert.
 //! - **No cross-machine causality**: the lineage `Tag` does not cross the wire
 //!   (Interval Tree Clocks are the follow-up).
-//! - The listener's reader thread, when blocked in `accept()` with no peer
-//!   connected, is not torn down on bus shutdown (a `Drop`-based stop is a
-//!   follow-up); harmless for tests/demos. (When it is reading or blocked
-//!   sending to a full channel, it exits cleanly once the strand is dropped.)
+//! - The listener's reader thread (and its bound port) **leak until process
+//!   exit**, unconditionally. The kernel never joins or drops strand workers on
+//!   shutdown — `run_until` just returns and the worker loops forever — so the
+//!   `EdgeListener` (and the `Receiver` it owns) is never dropped, and the
+//!   reader's `send`-fails-when-the-receiver-is-dropped stop therefore never
+//!   fires. A real teardown needs **kernel cooperation** (a worker shutdown
+//!   signal); harmless for short-lived tests/demos. The bound socket is not set
+//!   `SO_REUSEADDR`, so an immediate same-process re-bind to a *fixed* port
+//!   could fail (the tests/demo bind port 0).
 //!
 //! ## Bounded by construction (the untrusted-input guards)
 //! Frame headers are capped (`MAX_TAG`, `MAX_PAYLOAD`) so a hostile length
@@ -41,7 +46,10 @@
 //! stall. The peer is still *trusted* (no auth) — these guards keep a buggy or
 //! noisy peer from degrading the host, not a determined attacker.
 
+#![forbid(unsafe_code)]
+
 use spiderweb::{BusHandle, Socket, Strand, StrandError};
+use std::any::TypeId;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver};
@@ -77,6 +85,11 @@ pub struct Edge {
 
 struct Entry {
     tag: &'static str,
+    /// The bridged Rust type. One socket per distinct type is declared as the
+    /// strand's input (kernel subscription is by `TypeId`); `type_id` lets the
+    /// builder dedup them so the strand is not subscribed twice for one type
+    /// (which would double-deliver every message of that type).
+    type_id: TypeId,
     socket: Socket,
     pull: Pull,
     push: Push,
@@ -107,18 +120,36 @@ impl Edge {
     ) -> Self {
         let socket_obj = Socket::new::<T>(socket);
         let pull: Pull = Box::new(move |bus: &mut BusHandle| {
-            bus.recv_all::<T>()
+            // SOCKET-scoped drain (NOT `recv_all::<T>` by type): take only this
+            // socket's messages, so two bridges that share one Rust type don't
+            // vacuum / mis-tag each other's traffic. `encode` runs under
+            // catch_unwind so a panicking codec drops the frame instead of
+            // unwinding (and silently killing) the worker.
+            bus.recv::<T>(socket)
                 .unwrap_or_default()
                 .into_iter()
-                .map(|(_s, v)| encode(&v))
+                .filter_map(|v| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| encode(&v))).ok()
+                })
                 .collect()
         });
         let push: Push = Box::new(move |bus: &mut BusHandle, bytes: &[u8]| {
-            if let Some(v) = decode(bytes) {
+            // `decode` under catch_unwind too: a panicking codec degrades to a
+            // dropped frame, not a dead bus.
+            let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode(bytes)))
+                .ok()
+                .flatten();
+            if let Some(v) = decoded {
                 let _ = bus.publish(socket, v);
             }
         });
-        self.entries.push(Entry { tag, socket: socket_obj, pull, push });
+        self.entries.push(Entry {
+            tag,
+            type_id: TypeId::of::<T>(),
+            socket: socket_obj,
+            pull,
+            push,
+        });
         self
     }
 
@@ -127,9 +158,15 @@ impl Edge {
     /// over the socket.
     pub fn sender(self, name: &'static str, peer: impl Into<String>) -> EdgeSender {
         let mut socks = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         let mut pulls = Vec::new();
         for e in self.entries {
-            socks.push(e.socket);
+            // Declare each distinct type as an input ONCE (subscription is by
+            // TypeId), so the strand isn't double-subscribed for a shared type.
+            // Every entry still gets its own socket-scoped pull.
+            if seen.insert(e.type_id) {
+                socks.push(e.socket);
+            }
             pulls.push((e.tag, e.pull));
         }
         EdgeSender {
@@ -153,9 +190,12 @@ impl Edge {
         thread::spawn(move || reader_loop(listener, tx));
 
         let mut socks = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         let mut pushes = Vec::new();
         for e in self.entries {
-            socks.push(e.socket);
+            if seen.insert(e.type_id) {
+                socks.push(e.socket);
+            }
             pushes.push((e.tag, e.push));
         }
         Ok(EdgeListener {
@@ -416,5 +456,109 @@ mod tests {
             "bus B should receive the message bus A published over the socket, got {:?}",
             *got
         );
+    }
+
+    /// Publishes a distinct String on two different sockets, same Rust type.
+    struct TwoSource;
+    impl Strand for TwoSource {
+        fn name(&self) -> &str {
+            "two-source"
+        }
+        fn inputs(&self) -> &[Socket] {
+            &[]
+        }
+        fn outputs(&self) -> &[Socket] {
+            const S: [Socket; 2] = [Socket::new::<String>("wire.a"), Socket::new::<String>("wire.b")];
+            &S
+        }
+        fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+            bus.publish("wire.a", String::from("msg-a"))?;
+            bus.publish("wire.b", String::from("msg-b"))?;
+            bus.sleep(Duration::from_millis(10));
+            Ok(())
+        }
+    }
+
+    /// Collects Strings from ONE named socket (socket-scoped recv).
+    struct SocketCollector {
+        name: &'static str,
+        socket: &'static str,
+        socket_obj: Socket,
+        sink: Arc<Mutex<Vec<String>>>,
+    }
+    impl SocketCollector {
+        fn new(name: &'static str, socket: &'static str, sink: Arc<Mutex<Vec<String>>>) -> Self {
+            SocketCollector { name, socket, socket_obj: Socket::new::<String>(socket), sink }
+        }
+    }
+    impl Strand for SocketCollector {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn inputs(&self) -> &[Socket] {
+            std::slice::from_ref(&self.socket_obj)
+        }
+        fn outputs(&self) -> &[Socket] {
+            &[]
+        }
+        fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+            for v in bus.recv::<String>(self.socket)? {
+                self.sink.lock().unwrap().push(v);
+            }
+            bus.sleep(Duration::from_millis(5));
+            Ok(())
+        }
+    }
+
+    /// Two bridges of the SAME Rust type (String) on different sockets/tags must
+    /// route INDEPENDENTLY across the wire — no cross-contamination, no dead
+    /// channel. (Regression for the recv_all-by-TypeId bug: the old code had the
+    /// first bridge vacuum every String and mis-tag it, so `wire.b` traffic
+    /// arrived on `wire.a` and `wire.b` got nothing.)
+    #[test]
+    fn two_same_type_bridges_route_independently() {
+        let a_sink = Arc::new(Mutex::new(Vec::<String>::new()));
+        let b_sink = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        let listener = Edge::new()
+            .bridge::<String>("a", "wire.a", enc, dec)
+            .bridge::<String>("b", "wire.b", enc, dec)
+            .listener("edge-in", "127.0.0.1:0")
+            .expect("bind listener");
+        let port = listener.local_addr().port();
+
+        let a2 = a_sink.clone();
+        let b2 = b_sink.clone();
+        let recv_bus = thread::spawn(move || {
+            register_clone_type::<String>();
+            let mut bus = Bus::open();
+            bus.register(listener);
+            bus.register(SocketCollector::new("col-a", "wire.a", a2));
+            bus.register(SocketCollector::new("col-b", "wire.b", b2));
+            bus.run_until(Some(Duration::from_millis(800)));
+        });
+
+        let send_bus = thread::spawn(move || {
+            register_clone_type::<String>();
+            let mut bus = Bus::open();
+            bus.register(TwoSource);
+            bus.register(
+                Edge::new()
+                    .bridge::<String>("a", "wire.a", enc, dec)
+                    .bridge::<String>("b", "wire.b", enc, dec)
+                    .sender("edge-out", format!("127.0.0.1:{port}")),
+            );
+            bus.run_until(Some(Duration::from_millis(800)));
+        });
+
+        send_bus.join().unwrap();
+        recv_bus.join().unwrap();
+
+        let a = a_sink.lock().unwrap();
+        let b = b_sink.lock().unwrap();
+        assert!(a.iter().any(|s| s == "msg-a"), "wire.a should receive msg-a, got {:?}", *a);
+        assert!(!a.iter().any(|s| s == "msg-b"), "wire.a must NOT receive msg-b (cross-tag leak), got {:?}", *a);
+        assert!(b.iter().any(|s| s == "msg-b"), "wire.b should receive msg-b, got {:?}", *b);
+        assert!(!b.iter().any(|s| s == "msg-a"), "wire.b must NOT receive msg-a (cross-tag leak), got {:?}", *b);
     }
 }
