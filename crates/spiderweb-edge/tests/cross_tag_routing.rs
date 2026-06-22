@@ -1,5 +1,8 @@
-// TEMP reproduction: two same-Rust-type bridges with distinct tags/sockets.
-// Verifies whether `cmd` payloads are mis-tagged as `note` (the reported bug).
+//! Integration test (drives the crate from outside, as a user would): two
+//! bridges of the same Rust type, with DISTINCT wire tags and DISTINCT local
+//! socket names on each side. The wire routes by TAG, so a message published on
+//! the sender's `wire.cmd` (tag `cmd`) must arrive on the listener's `cmd.in`,
+//! never on `note.in`. Regression for the recv_all-by-TypeId cross-tag bug.
 
 use spiderweb::{register_clone_type, Bus, BusHandle, Socket, Strand, StrandError};
 use spiderweb_edge::Edge;
@@ -15,7 +18,7 @@ fn dec(b: &[u8]) -> Option<String> {
     String::from_utf8(b.to_vec()).ok()
 }
 
-// Source publishes on BOTH wire.note and wire.cmd every tick.
+/// Bus A: publishes a distinct String on two different local sockets.
 struct Source;
 impl Strand for Source {
     fn name(&self) -> &str {
@@ -25,9 +28,7 @@ impl Strand for Source {
         &[]
     }
     fn outputs(&self) -> &[Socket] {
-        const N: Socket = Socket::new::<String>("wire.note");
-        const C: Socket = Socket::new::<String>("wire.cmd");
-        static SS: [Socket; 2] = [N, C];
+        const SS: [Socket; 2] = [Socket::new::<String>("wire.note"), Socket::new::<String>("wire.cmd")];
         &SS
     }
     fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
@@ -38,19 +39,19 @@ impl Strand for Source {
     }
 }
 
-// Collector on the receiving bus records which socket each String arrived on.
+/// Bus B: records which local socket each received String landed on. One String
+/// subscription receives every String (routing is by type); `recv_all` reports
+/// each with its true socket name.
 struct Collector {
-    sink: Arc<Mutex<Vec<(String, String)>>>, // (socket, value)
+    sink: Arc<Mutex<Vec<(String, String)>>>,
 }
 impl Strand for Collector {
     fn name(&self) -> &str {
         "collector"
     }
     fn inputs(&self) -> &[Socket] {
-        const N: Socket = Socket::new::<String>("note.in");
-        const C: Socket = Socket::new::<String>("cmd.in");
-        static SS: [Socket; 2] = [N, C];
-        &SS
+        const S: Socket = Socket::new::<String>("note.in");
+        std::slice::from_ref(&S)
     }
     fn outputs(&self) -> &[Socket] {
         &[]
@@ -65,10 +66,9 @@ impl Strand for Collector {
 }
 
 #[test]
-fn two_same_type_bridges_keep_their_tags() {
+fn distinct_tags_route_to_distinct_sockets_across_the_wire() {
     let collected = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
 
-    // Receiver bus B: two bridges, distinct wire tags -> distinct local sockets.
     let listener = Edge::new()
         .bridge::<String>("note", "note.in", enc, dec)
         .bridge::<String>("cmd", "cmd.in", enc, dec)
@@ -85,7 +85,6 @@ fn two_same_type_bridges_keep_their_tags() {
         bus.run_until(Some(Duration::from_millis(900)));
     });
 
-    // Sender bus A: same two bridges. Source publishes on wire.note + wire.cmd.
     let send_bus = thread::spawn(move || {
         register_clone_type::<String>();
         let mut bus = Bus::open();
@@ -103,23 +102,9 @@ fn two_same_type_bridges_keep_their_tags() {
     recv_bus.join().unwrap();
 
     let got = collected.lock().unwrap();
-    let note_on_noteln = got.iter().filter(|(s, v)| s == "note.in" && v == "NOTE-payload").count();
-    let cmd_on_cmdln = got.iter().filter(|(s, v)| s == "cmd.in" && v == "CMD-payload").count();
-    let cmd_on_noteln = got.iter().filter(|(s, v)| s == "note.in" && v == "CMD-payload").count();
-    let note_on_cmdln = got.iter().filter(|(s, v)| s == "cmd.in" && v == "NOTE-payload").count();
-
-    eprintln!("--- delivered (socket, value) pairs ---");
-    for (s, v) in got.iter() {
-        eprintln!("  {s} <- {v}");
-    }
-    eprintln!("NOTE-payload on note.in : {note_on_noteln}");
-    eprintln!("CMD-payload  on cmd.in  : {cmd_on_cmdln}");
-    eprintln!("CMD-payload  on note.in (MIS-TAG): {cmd_on_noteln}");
-    eprintln!("NOTE-payload on cmd.in  (MIS-TAG): {note_on_cmdln}");
-
-    // The CORRECT outcome: CMD-payload arrives on cmd.in, NOTE on note.in,
-    // and NEITHER appears under the wrong socket. If the bug is real, we expect
-    // CMD-payload to be shipped under tag "note" and land on note.in instead.
-    assert!(cmd_on_cmdln > 0, "cmd channel never transmitted (CMD-payload missing on cmd.in)");
-    assert_eq!(cmd_on_noteln, 0, "CMD-payload mis-tagged and delivered on note.in");
+    let on = |sock: &str, val: &str| got.iter().filter(|(s, v)| s == sock && v == val).count();
+    assert!(on("cmd.in", "CMD-payload") > 0, "cmd tag must transmit to cmd.in, got {:?}", *got);
+    assert!(on("note.in", "NOTE-payload") > 0, "note tag must transmit to note.in, got {:?}", *got);
+    assert_eq!(on("note.in", "CMD-payload"), 0, "CMD must NOT be mis-tagged onto note.in, got {:?}", *got);
+    assert_eq!(on("cmd.in", "NOTE-payload"), 0, "NOTE must NOT be mis-tagged onto cmd.in, got {:?}", *got);
 }
