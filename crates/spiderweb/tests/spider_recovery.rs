@@ -425,3 +425,214 @@ fn stale_quarantine_does_not_shut_down_the_bus() {
         n
     );
 }
+
+// ---------------------------------------------------------------------------
+// Panic isolation.
+//
+// A strand whose `run()` PANICS (not an explicit `Err(Crashed)`, but a real
+// `panic!` / unwrap / index-out-of-bounds) must be caught by the worker and
+// converted into a `Crashed` lifecycle event — identical treatment to an
+// explicit crash. The alternative the worker is guarding against: the panic
+// unwinds past `run()`, silently kills the worker thread, skips the Crashed
+// event (so the spider never gets its restart/quarantine decision), and under
+// `Bus::run()` hangs the whole bus forever because the dead slot never counts
+// toward `done_count`.
+//
+// (These tests rely on unwinding panics — the default. Under `panic = "abort"`
+// the catch is impossible by design; that is documented for deployers.)
+//
+// NOTE: each caught panic still prints its message + (if enabled) a backtrace
+// to stderr via the default panic hook. That stderr noise during these three
+// tests is EXPECTED, not a failure.
+// ---------------------------------------------------------------------------
+
+struct AlwaysPanic {
+    ticks: Arc<AtomicU32>,
+}
+
+impl Strand for AlwaysPanic {
+    fn name(&self) -> &str {
+        "always-panic"
+    }
+    fn inputs(&self) -> &[Socket] {
+        &[]
+    }
+    fn outputs(&self) -> &[Socket] {
+        &[]
+    }
+    fn run(&mut self, _bus: &mut BusHandle) -> Result<(), StrandError> {
+        self.ticks.fetch_add(1, Ordering::SeqCst);
+        panic!("intentional panic inside a strand");
+    }
+}
+
+/// A strand that PANICS every tick must be treated exactly like one that
+/// returns `Err(Crashed)`: the spider restarts it up to its limit, then
+/// quarantines it. This is the panic-path analogue of
+/// `spider_quarantines_after_max_crashes`. Total ticks should be >= 4
+/// (3 restarts + the quarantining crash). If the panic instead killed the
+/// worker silently, the spider would see exactly one crash and no more — the
+/// count would stall at 1 and the restart/quarantine cycle would never run.
+#[test]
+fn panicking_strand_is_quarantined_like_a_crash() {
+    let ticks = Arc::new(AtomicU32::new(0));
+    let ticks_factory = ticks.clone();
+
+    let mut bus = Bus::open();
+    bus.register_spec(StrandSpec::new("always-panic", move || {
+        Box::new(AlwaysPanic {
+            ticks: ticks_factory.clone(),
+        })
+    }));
+    bus.register_spider(StrandSpec::new("spider", || Box::new(Spider::new())));
+    bus.run_until(Some(Duration::from_millis(800)));
+
+    let final_ticks = ticks.load(Ordering::SeqCst);
+    assert!(
+        final_ticks >= 4,
+        "a panicking strand should be restarted then quarantined like a crash \
+         (expected >= 4 ticks, got {}); a stall at 1 means the panic killed the \
+         worker silently instead of becoming a Crashed event",
+        final_ticks
+    );
+}
+
+/// `Bus::run()` (run-forever) must wind down after a lone strand PANICS with no
+/// spider to revive it — the panic is terminal accounting, just like a crash.
+/// The danger this guards: a panic that escapes `run()` kills the worker
+/// without ever incrementing `done_count`, so `done_count >= total_slots` is
+/// never reached and `run()` hangs forever. We run on a worker thread with a
+/// generous timeout so a regression surfaces as a failed assertion, not a hung
+/// suite.
+#[test]
+fn run_winds_down_after_a_panic_with_no_spider() {
+    use std::sync::mpsc;
+
+    let ticks = Arc::new(AtomicU32::new(0));
+    let ticks_factory = ticks.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+
+    let worker = std::thread::spawn(move || {
+        let mut bus = Bus::open();
+        // Live strand (no factory) + no spider: the panic-as-crash is terminal.
+        bus.register(AlwaysPanic {
+            ticks: ticks_factory,
+        });
+        bus.run();
+        let _ = done_tx.send(());
+    });
+
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Bus::run() should wind down after the lone strand panics (no spider)");
+    worker.join().unwrap();
+
+    assert_eq!(
+        ticks.load(Ordering::SeqCst),
+        1,
+        "the strand should panic exactly once before the web winds down"
+    );
+}
+
+/// Panic isolation is per-worker: a strand that panics on every tick must NOT
+/// take down a healthy strand sitting next to it. The spider keeps restarting
+/// the panicker (3x then quarantine) while the heartbeat ticks on undisturbed.
+/// If a panic could escape its worker and poison shared kernel state, the
+/// heartbeat would stop; we require it to keep beating.
+#[test]
+fn a_panicking_strand_does_not_kill_its_neighbor() {
+    let beats = Arc::new(AtomicU32::new(0));
+    let panic_ticks = Arc::new(AtomicU32::new(0));
+    let panic_factory = panic_ticks.clone();
+
+    let mut bus = Bus::open();
+    bus.register(Heartbeat {
+        beats: beats.clone(),
+    });
+    bus.register_spec(StrandSpec::new("always-panic", move || {
+        Box::new(AlwaysPanic {
+            ticks: panic_factory.clone(),
+        })
+    }));
+    bus.register_spider(StrandSpec::new("spider", || Box::new(Spider::new())));
+    bus.run_until(Some(Duration::from_millis(300)));
+
+    let n = beats.load(Ordering::SeqCst);
+    assert!(
+        n >= 5,
+        "the heartbeat should keep ticking (got {} beats) while the neighbor \
+         panics repeatedly — a panic must stay isolated to its own worker",
+        n
+    );
+    assert!(
+        panic_ticks.load(Ordering::SeqCst) >= 1,
+        "sanity: the panicking strand should have actually run and panicked"
+    );
+}
+
+/// Watches the lifecycle bus and records the `reason` of every `Crashed`
+/// event it sees, so a test can assert the panic message survived the
+/// `catch_unwind` round-trip into the `Crashed` reason.
+struct CrashReasonWatcher {
+    reasons: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl Strand for CrashReasonWatcher {
+    fn name(&self) -> &str {
+        "crash-reason-watcher"
+    }
+    fn inputs(&self) -> &[Socket] {
+        const S: Socket = Socket::new::<LifecycleEvent>(SYS_LIFECYCLE);
+        std::slice::from_ref(&S)
+    }
+    fn outputs(&self) -> &[Socket] {
+        &[]
+    }
+    fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+        for (sock, evt) in bus.recv_all::<LifecycleEvent>()? {
+            if sock != SYS_LIFECYCLE {
+                continue;
+            }
+            if let LifecycleEvent::Crashed { reason, .. } = evt {
+                self.reasons.lock().unwrap().push(reason);
+            }
+        }
+        bus.sleep(Duration::from_millis(5));
+        Ok(())
+    }
+}
+
+/// The panic message must survive into the `Crashed` reason — otherwise a
+/// quarantined strand's forensic trail says only "panicked" and tells an
+/// operator nothing. `AlwaysPanic` panics with a known literal; the recovered
+/// reason should carry it (prefixed with "panicked:").
+#[test]
+fn panic_message_is_recovered_into_the_crash_reason() {
+    let reasons = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let ticks = Arc::new(AtomicU32::new(0));
+
+    let mut bus = Bus::open();
+    // Live panicker (no factory) + no spider: it crashes exactly once, which
+    // is enough to emit one Crashed lifecycle event for the watcher to catch.
+    bus.register(AlwaysPanic {
+        ticks: ticks.clone(),
+    });
+    bus.register(CrashReasonWatcher {
+        reasons: reasons.clone(),
+    });
+    bus.run_until(Some(Duration::from_millis(300)));
+
+    let captured = reasons.lock().unwrap().clone();
+    assert!(
+        captured
+            .iter()
+            .any(|r| r.contains("intentional panic inside a strand")),
+        "the Crashed reason should carry the panic message; got {:?}",
+        captured
+    );
+    assert!(
+        captured.iter().any(|r| r.starts_with("panicked:")),
+        "a panic-derived crash reason should be tagged 'panicked:'; got {:?}",
+        captured
+    );
+}

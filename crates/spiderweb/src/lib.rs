@@ -1540,11 +1540,41 @@ fn run_strand_worker(
         kernel.record_arrivals(&name, &inbox);
 
         let mut handle = BusHandle::new(name.clone(), inbox, kernel.clone());
-        let result = strand.run(&mut handle);
+        // Isolate the strand's panic. A panicking strand must NOT silently
+        // kill its worker — that would skip the Crashed lifecycle event, deny
+        // the spider its restart/quarantine decision, and (under Bus::run())
+        // hang the whole bus forever, since the slot would never count toward
+        // done_count. Catch it and treat it exactly like an explicit crash.
+        // (Relies on unwinding panics; `panic = "abort"` is uncatchable, by
+        // design — document that for production deployers.)
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| strand.run(&mut handle)));
+        let panicked = outcome.is_err();
+        let result = match outcome {
+            Ok(r) => r,
+            Err(payload) => {
+                // Recover the panic message so the Crashed reason — which the
+                // spider logs and stores in the Quarantined event — is a real
+                // forensic signal, not a bare "panicked". Standard panics carry
+                // a `&str` (panic!("lit")) or `String` (panic!("{}", x)); a
+                // non-string payload is rare (explicit panic_any) and we fall
+                // back to a marker.
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "panicked (non-string payload)".to_string());
+                Err(StrandError::Crashed(format!("panicked: {}", msg)))
+            }
+        };
 
-        let outbox = handle.take_outbox();
-        for (socket, tag, env) in outbox {
-            kernel.deliver(socket, tag, env, &name);
+        // Deliver this tick's output — but NEVER a half-built outbox from a
+        // panicked run (its work did not complete and may be inconsistent).
+        if !panicked {
+            let outbox = handle.take_outbox();
+            for (socket, tag, env) in outbox {
+                kernel.deliver(socket, tag, env, &name);
+            }
         }
 
         match result {
@@ -1693,6 +1723,16 @@ impl Bus {
         self.kernel.fabric.lock().unwrap().set_position(node, pos);
     }
 
+    /// Run the bus forever (until every strand is terminally done, Ctrl-C, or
+    /// `ControlMsg::Shutdown`).
+    ///
+    /// **Panic policy (production note).** Each strand runs under
+    /// `catch_unwind`, so a panicking strand becomes a `Crashed` lifecycle
+    /// event (spider restart/quarantine applies) and is isolated from its
+    /// neighbors. This relies on the default `panic = "unwind"`. If you build
+    /// with `panic = "abort"`, a single strand panic aborts the **whole
+    /// process** — no Crashed event, no spider notification, no clean shutdown.
+    /// Keep `unwind` for any deployment that needs strand isolation.
     pub fn run(mut self) {
         self.run_until(None)
     }
