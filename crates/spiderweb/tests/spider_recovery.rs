@@ -14,7 +14,7 @@ use spiderweb::{
     Bus, BusHandle, ControlMsg, LifecycleEvent, Socket, Strand, StrandError, StrandSpec,
     SYS_CONTROL, SYS_LIFECYCLE,
 };
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -635,4 +635,327 @@ fn panic_message_is_recovered_into_the_crash_reason() {
         "a panic-derived crash reason should be tagged 'panicked:'; got {:?}",
         captured
     );
+}
+
+// ---------------------------------------------------------------------------
+// Graceful shutdown.
+//
+// When `run_until` winds down, the kernel must signal every worker to stop and
+// JOIN it, so each strand is actually DROPPED (its `Drop` runs). Without this,
+// a clean, still-running strand spins forever after `run_until` returns and is
+// never dropped — leaking its thread and any resource its `Drop` would release
+// (sockets, child reader threads, bound ports). A strand's `Drop` running is
+// the observable proxy for "the worker was joined".
+// ---------------------------------------------------------------------------
+
+struct DropMarker {
+    dropped: Arc<AtomicBool>,
+    ran: Arc<AtomicU32>,
+}
+
+impl Strand for DropMarker {
+    fn name(&self) -> &str {
+        "drop-marker"
+    }
+    fn inputs(&self) -> &[Socket] {
+        &[]
+    }
+    fn outputs(&self) -> &[Socket] {
+        &[]
+    }
+    fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+        self.ran.fetch_add(1, Ordering::SeqCst);
+        bus.sleep(Duration::from_millis(5));
+        Ok(())
+    }
+}
+
+impl Drop for DropMarker {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A clean, never-crashing live strand must be dropped when `run_until` winds
+/// down on max-duration. If the worker were left spinning (the pre-graceful-
+/// shutdown behavior), `Drop` would never run and `dropped` would stay false.
+#[test]
+fn clean_strand_is_dropped_on_graceful_shutdown() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let ran = Arc::new(AtomicU32::new(0));
+
+    let mut bus = Bus::open();
+    bus.register(DropMarker {
+        dropped: dropped.clone(),
+        ran: ran.clone(),
+    });
+    bus.run_until(Some(Duration::from_millis(100)));
+
+    assert!(
+        ran.load(Ordering::SeqCst) >= 1,
+        "sanity: the strand should have ticked at least once before shutdown"
+    );
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "a clean still-running strand must be dropped when run_until winds down \
+         (worker signaled + joined); false means the worker leaked and Drop never ran"
+    );
+}
+
+/// The same guarantee for a factory (spec) strand run under a spider: when the
+/// run loop exits, the spider, the worker, and the strand are all joined and
+/// dropped.
+#[test]
+fn spec_strand_is_dropped_on_graceful_shutdown() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let ran = Arc::new(AtomicU32::new(0));
+    let dropped_f = dropped.clone();
+    let ran_f = ran.clone();
+
+    let mut bus = Bus::open();
+    bus.register_spec(StrandSpec::new("drop-marker", move || {
+        Box::new(DropMarker {
+            dropped: dropped_f.clone(),
+            ran: ran_f.clone(),
+        })
+    }));
+    bus.register_spider(StrandSpec::new("spider", || Box::new(Spider::new())));
+    bus.run_until(Some(Duration::from_millis(100)));
+
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "a spec strand must be dropped when run_until winds down; false means its \
+         worker was never joined"
+    );
+}
+
+/// Publishes `ControlMsg::Shutdown` once after a short delay, then keeps
+/// ticking. Used to exercise the Shutdown control path, which now `break 'run`s
+/// into the join logic (it used to bare-`return`, skipping the drop/join).
+struct ShutdownAfterOneTick {
+    sent: bool,
+}
+
+impl Strand for ShutdownAfterOneTick {
+    fn name(&self) -> &str {
+        "shutter"
+    }
+    fn inputs(&self) -> &[Socket] {
+        &[]
+    }
+    fn outputs(&self) -> &[Socket] {
+        const S: Socket = Socket::new::<ControlMsg>(SYS_CONTROL);
+        std::slice::from_ref(&S)
+    }
+    fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+        if !self.sent {
+            bus.sleep(Duration::from_millis(20));
+            bus.publish_static(SYS_CONTROL, ControlMsg::Shutdown)?;
+            self.sent = true;
+        }
+        bus.sleep(Duration::from_millis(10));
+        Ok(())
+    }
+}
+
+/// A `ControlMsg::Shutdown` must wind the bus down through the graceful path:
+/// exit the run loop AND drop the strands. We give a long max_duration window
+/// so the only way the bus exits quickly is via the Shutdown message, and we
+/// assert both prompt return and that the live strand was dropped.
+#[test]
+fn shutdown_message_winds_down_and_drops_strands() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let ran = Arc::new(AtomicU32::new(0));
+
+    let mut bus = Bus::open();
+    bus.register(DropMarker {
+        dropped: dropped.clone(),
+        ran: ran.clone(),
+    });
+    bus.register(ShutdownAfterOneTick { sent: false });
+
+    let start = std::time::Instant::now();
+    bus.run_until(Some(Duration::from_secs(10)));
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the bus should wind down promptly via ControlMsg::Shutdown, not wait out \
+         the 10s window (took {:?})",
+        elapsed
+    );
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "strands must be dropped after a ControlMsg::Shutdown wind-down"
+    );
+}
+
+/// A spider that observes lifecycle events but never acts — never restarts,
+/// never quarantines. A strand that crashes under it stays PARKED in the slot
+/// map (its worker already returned).
+struct PassiveSpider;
+
+impl Strand for PassiveSpider {
+    fn name(&self) -> &str {
+        "passive-spider"
+    }
+    fn inputs(&self) -> &[Socket] {
+        const S: Socket = Socket::new::<LifecycleEvent>(SYS_LIFECYCLE);
+        std::slice::from_ref(&S)
+    }
+    fn outputs(&self) -> &[Socket] {
+        &[]
+    }
+    fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+        let _ = bus.recv_all::<LifecycleEvent>()?;
+        bus.sleep(Duration::from_millis(10));
+        Ok(())
+    }
+}
+
+/// Shutdown must join a PARKED crashed slot without hanging. A parked slot's
+/// worker already returned (it sent WorkerExit::Crashed), so its retained
+/// JoinHandle joins instantly — but the slot is still in the map, so the
+/// shutdown snapshot picks it up. We prove the join completes (no hang) and the
+/// co-located live strand is still dropped.
+#[test]
+fn shutdown_joins_a_parked_crashed_slot_without_hanging() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let ran = Arc::new(AtomicU32::new(0));
+    let crash_ticks = Arc::new(AtomicU32::new(0));
+    let crash_factory = crash_ticks.clone();
+
+    let mut bus = Bus::open();
+    bus.register(DropMarker {
+        dropped: dropped.clone(),
+        ran: ran.clone(),
+    });
+    bus.register_spec(StrandSpec::new("always-crash", move || {
+        Box::new(AlwaysCrash {
+            ticks: crash_factory.clone(),
+        })
+    }));
+    bus.register_spider(StrandSpec::new("passive-spider", || Box::new(PassiveSpider)));
+
+    let start = std::time::Instant::now();
+    bus.run_until(Some(Duration::from_millis(200)));
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "shutdown must not hang on a parked crashed slot (took {:?})",
+        elapsed
+    );
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "the live strand must still be dropped past the parked crashed slot"
+    );
+    assert!(
+        crash_ticks.load(Ordering::SeqCst) >= 1,
+        "sanity: the strand should have crashed at least once"
+    );
+}
+
+/// A strand that does long-running work INSIDE `run()` but cooperates by
+/// polling `is_shutting_down()` must exit promptly on shutdown and be joined
+/// (its `Drop` runs) — no detach, no timeout. This is the intended way for a
+/// blocking/long strand to honor graceful shutdown.
+struct CooperativeWorker {
+    dropped: Arc<AtomicBool>,
+}
+
+impl Strand for CooperativeWorker {
+    fn name(&self) -> &str {
+        "cooperative"
+    }
+    fn inputs(&self) -> &[Socket] {
+        &[]
+    }
+    fn outputs(&self) -> &[Socket] {
+        &[]
+    }
+    fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+        // Ongoing work that would otherwise run past shutdown — but it checks
+        // the flag and returns when the bus is winding down.
+        while !bus.is_shutting_down() {
+            bus.sleep(Duration::from_millis(5));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CooperativeWorker {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn cooperative_strand_exits_via_is_shutting_down() {
+    let dropped = Arc::new(AtomicBool::new(false));
+
+    let mut bus = Bus::open();
+    bus.register(CooperativeWorker {
+        dropped: dropped.clone(),
+    });
+
+    let start = std::time::Instant::now();
+    bus.run_until(Some(Duration::from_millis(100)));
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "a cooperative strand should exit promptly on shutdown (took {:?})",
+        elapsed
+    );
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "a strand that polls is_shutting_down() and returns must be joined and dropped"
+    );
+}
+
+/// A strand that WEDGES inside `run()` (blocks far past the join deadline,
+/// ignoring `is_shutting_down()`) must NOT hang shutdown. The kernel's bounded
+/// best-effort join detaches it after its deadline and lets `run_until` return.
+/// This is the safety net behind the cooperative contract: a buggy strand
+/// degrades to one leaked thread, never a frozen bus. (This test takes a few
+/// seconds — it waits out the kernel's join deadline by design.)
+struct WedgedWorker;
+
+impl Strand for WedgedWorker {
+    fn name(&self) -> &str {
+        "wedged"
+    }
+    fn inputs(&self) -> &[Socket] {
+        &[]
+    }
+    fn outputs(&self) -> &[Socket] {
+        &[]
+    }
+    fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+        // Deliberately ignores is_shutting_down() and blocks far longer than
+        // the kernel's join deadline.
+        bus.sleep(Duration::from_secs(60));
+        Ok(())
+    }
+}
+
+#[test]
+fn wedged_strand_does_not_hang_shutdown() {
+    use std::sync::mpsc;
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut bus = Bus::open();
+        bus.register(WedgedWorker);
+        bus.run_until(Some(Duration::from_millis(100)));
+        let _ = done_tx.send(());
+    });
+
+    // The strand blocks 60s, but the kernel's bounded join must let run_until
+    // return well before that. Generous outer timeout to avoid flakiness.
+    done_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("run_until must return despite a strand wedged for 60s (bounded join)");
+    worker.join().unwrap();
 }
