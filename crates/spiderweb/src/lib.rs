@@ -20,6 +20,7 @@
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -129,6 +130,75 @@ pub enum LifecycleEvent {
     /// An intersection emerged: `node` is where the fabric first
     /// observed two distinct threads cross. v1.3.
     IntersectionEmerged { node: NodeId, threads: Vec<ThreadId> },
+}
+
+// -----------------------------------------------------------------------------
+// Observability — pull-able BusStats
+// -----------------------------------------------------------------------------
+
+/// Per-strand counters. One entry per slot present at snapshot time.
+/// `processed` is how many messages this strand's *current* instance has
+/// drained from its inbox (it resets if the spider restarts the strand, since
+/// a restart installs a fresh slot).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StrandStats {
+    pub name: String,
+    pub processed: u64,
+}
+
+/// A read-only snapshot of bus-wide telemetry — the countable replacement for
+/// `spider.log(&str)` strings. Pull it with [`Bus::stats`], or from inside a
+/// strand during a run with [`BusHandle::stats`]. Cheap: the kernel-wide
+/// counters are lock-free atomics and the structural fields derive from the
+/// same bounded state [`Bus::fabric_snapshot`] reads. Everything here is
+/// bounded — the counters are a fixed set and `per_strand` is bounded by the
+/// fabric's `THREAD_CAP`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BusStats {
+    // --- kernel-wide cumulative counters (monotonic) ---
+    /// Total physical deliveries of strand-published messages to subscribers —
+    /// work, vibrations, and control — where a fan-out to N subscribers counts
+    /// N. Excludes the kernel's own internal lifecycle fan-out, which is
+    /// counted precisely by kind in the fields below.
+    pub delivered: u64,
+    /// Messages dropped from a per-type pending buffer that was at
+    /// `PENDING_BUFFER_CAP` with no subscriber yet — the honest "lost because
+    /// nobody was listening and the buffer was full" signal.
+    pub pending_evictions: u64,
+    /// Total [`Vibration`] messages delivered on [`SYS_VIBRATION`].
+    pub vibrations: u64,
+    // --- lifecycle event counts by kind ---
+    pub registered: u64,
+    pub restarted: u64,
+    pub crashed: u64,
+    pub detached: u64,
+    pub quarantined: u64,
+    /// Times a message *type*'s pending buffer transitioned empty→non-empty
+    /// (the first message of a type-burst), NOT the count of individual
+    /// buffered messages — it mirrors `LifecycleEvent::Buffered`.
+    pub buffered: u64,
+    /// Times a newly-arriving subscriber was replayed a non-empty pending
+    /// buffer (mirrors `LifecycleEvent::Flushed`).
+    pub flushed: u64,
+    pub threads_formed: u64,
+    pub intersections_emerged: u64,
+    // --- structural, derived from the fabric + slot table ---
+    /// Strands present in the slot table at snapshot time (includes a parked
+    /// crashed slot awaiting the spider's decision). Always equal to
+    /// `per_strand.len()` — provided for convenience.
+    pub active_strands: usize,
+    pub threads: usize,
+    pub intersections: usize,
+    /// Distinct fabric vertices. Derived from [`FabricSnapshot::adjacency`], so
+    /// it counts every node that appears in any thread OR as an edge endpoint —
+    /// including endpoints whose thread has since been evicted. It can
+    /// therefore exceed what `threads` alone would imply; do not assume
+    /// `nodes == threads`.
+    pub nodes: usize,
+    pub edges: usize,
+    /// Sum of every fabric edge's delivery count.
+    pub edge_traffic_total: u64,
+    pub per_strand: Vec<StrandStats>,
 }
 
 // -----------------------------------------------------------------------------
@@ -1067,6 +1137,13 @@ impl BusHandle {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Pull a live [`BusStats`] telemetry snapshot from inside a strand — the
+    /// way an orchestrator strand (the spider) or a `webctl top` reporter reads
+    /// web-wide health while the bus is running, instead of parsing log lines.
+    pub fn stats(&self) -> BusStats {
+        self.kernel.stats()
+    }
+
     fn take_outbox(&mut self) -> Vec<Carrier> {
         std::mem::take(&mut self.outbox)
     }
@@ -1131,12 +1208,36 @@ struct StrandSlot {
     done_rx: Mutex<Option<Receiver<WorkerExit>>>,
     generation: std::sync::atomic::AtomicUsize,
     join: Mutex<Option<JoinHandle<()>>>,
+    /// Messages this slot's current worker has drained from the inbox, for
+    /// per-strand throughput in [`BusStats`]. Lock-free; `Relaxed` (telemetry,
+    /// not synchronization).
+    processed: AtomicU64,
 }
 
 #[derive(Debug)]
 enum WorkerExit {
     Detach,
     Crashed(String),
+}
+
+/// Lock-free kernel-wide counters behind [`BusStats`]. Every field is an
+/// independent monotonic tally read/written `Relaxed` — they are for
+/// observability, not synchronization, so a reader seeing a slightly stale mix
+/// across fields is fine and expected.
+#[derive(Default)]
+struct KernelStats {
+    delivered: AtomicU64,
+    pending_evictions: AtomicU64,
+    vibrations: AtomicU64,
+    registered: AtomicU64,
+    restarted: AtomicU64,
+    crashed: AtomicU64,
+    detached: AtomicU64,
+    quarantined: AtomicU64,
+    buffered: AtomicU64,
+    flushed: AtomicU64,
+    threads_formed: AtomicU64,
+    intersections_emerged: AtomicU64,
 }
 
 // -----------------------------------------------------------------------------
@@ -1173,6 +1274,8 @@ struct Kernel {
     /// is sufficient: it is a one-way latch, and the subsequent thread
     /// `join` is the real happens-before edge.
     shutdown: std::sync::atomic::AtomicBool,
+    /// Lock-free observability counters, read out by [`Bus::stats`].
+    stats: KernelStats,
 }
 
 impl Kernel {
@@ -1195,6 +1298,7 @@ impl Kernel {
             control_rx: Mutex::new(Some(control_rx)),
             spider_name: Mutex::new(None),
             shutdown: std::sync::atomic::AtomicBool::new(false),
+            stats: KernelStats::default(),
         });
 
         kernel
@@ -1222,6 +1326,7 @@ impl Kernel {
             done_rx: Mutex::new(Some(done_rx)),
             generation: std::sync::atomic::AtomicUsize::new(0),
             join: Mutex::new(None),
+            processed: AtomicU64::new(0),
         });
 
         let first_strand = match slot.factory.as_ref() {
@@ -1275,6 +1380,7 @@ impl Kernel {
             done_rx: Mutex::new(Some(done_rx)),
             generation: std::sync::atomic::AtomicUsize::new(0),
             join: Mutex::new(None),
+            processed: AtomicU64::new(0),
         });
 
         for sock in strand.inputs() {
@@ -1363,8 +1469,70 @@ impl Kernel {
     }
 
     fn publish_lifecycle(&self, evt: LifecycleEvent) {
+        // Tally by kind for BusStats before the event is moved into the
+        // envelope. This is the single choke point for every lifecycle event,
+        // so counting here catches them all exactly once.
+        let counter = match &evt {
+            LifecycleEvent::Registered { .. } => &self.stats.registered,
+            LifecycleEvent::Restarted { .. } => &self.stats.restarted,
+            LifecycleEvent::Crashed { .. } => &self.stats.crashed,
+            LifecycleEvent::Detached { .. } => &self.stats.detached,
+            LifecycleEvent::Quarantined { .. } => &self.stats.quarantined,
+            LifecycleEvent::Buffered { .. } => &self.stats.buffered,
+            LifecycleEvent::Flushed { .. } => &self.stats.flushed,
+            LifecycleEvent::ThreadFormed { .. } => &self.stats.threads_formed,
+            LifecycleEvent::IntersectionEmerged { .. } => &self.stats.intersections_emerged,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+
         let env: Envelope = Box::new(evt);
         self.deliver_internal(SYS_LIFECYCLE, env, "kernel");
+    }
+
+    /// Build a [`BusStats`] snapshot: lock-free counter reads + one fabric
+    /// snapshot + a pass over the slot table. The fabric and slot locks are
+    /// taken (and released) separately — never nested — so this never
+    /// deadlocks against `deliver`/`run_until`. Safe to call from a strand
+    /// mid-run or from the embedder after the run.
+    fn stats(&self) -> BusStats {
+        let s = &self.stats;
+        let fab = self.fabric.lock_tolerant().snapshot();
+        let adj = fab.adjacency();
+        let edge_traffic_total: u64 = fab.edge_traffic.iter().map(|(_, _, n)| *n).sum();
+
+        let mut per_strand: Vec<StrandStats> = self
+            .slots
+            .lock_tolerant()
+            .values()
+            .map(|slot| StrandStats {
+                name: slot.name.clone(),
+                processed: slot.processed.load(Ordering::Relaxed),
+            })
+            .collect();
+        per_strand.sort_by(|a, b| a.name.cmp(&b.name)); // deterministic
+        let active_strands = per_strand.len();
+
+        BusStats {
+            delivered: s.delivered.load(Ordering::Relaxed),
+            pending_evictions: s.pending_evictions.load(Ordering::Relaxed),
+            vibrations: s.vibrations.load(Ordering::Relaxed),
+            registered: s.registered.load(Ordering::Relaxed),
+            restarted: s.restarted.load(Ordering::Relaxed),
+            crashed: s.crashed.load(Ordering::Relaxed),
+            detached: s.detached.load(Ordering::Relaxed),
+            quarantined: s.quarantined.load(Ordering::Relaxed),
+            buffered: s.buffered.load(Ordering::Relaxed),
+            flushed: s.flushed.load(Ordering::Relaxed),
+            threads_formed: s.threads_formed.load(Ordering::Relaxed),
+            intersections_emerged: s.intersections_emerged.load(Ordering::Relaxed),
+            active_strands,
+            threads: fab.threads.len(),
+            intersections: fab.intersections.len(),
+            nodes: adj.nodes.len(),
+            edges: adj.edges.len(),
+            edge_traffic_total,
+            per_strand,
+        }
     }
 
     /// Publish a control message. The kernel is the only subscriber
@@ -1425,6 +1593,7 @@ impl Kernel {
             let was_empty = buf.is_empty();
             if buf.len() >= Self::PENDING_BUFFER_CAP {
                 buf.remove(0);
+                self.stats.pending_evictions.fetch_add(1, Ordering::Relaxed);
             }
             buf.push((socket, out_tag, buffered));
 
@@ -1469,6 +1638,16 @@ impl Kernel {
                 );
                 let _ = returned;
             }
+        }
+        // Telemetry: count physical deliveries (one per subscriber), and
+        // vibrations as a class (one per emitted message, regardless of how
+        // many feel it) so the spider/webctl can see web-wide backpressure/
+        // starvation volume without parsing log strings.
+        self.stats
+            .delivered
+            .fetch_add(snapshot.len() as u64, Ordering::Relaxed);
+        if socket == SYS_VIBRATION {
+            self.stats.vibrations.fetch_add(1, Ordering::Relaxed);
         }
 
         // Record the physical traffic edges this delivery crossed:
@@ -1601,6 +1780,13 @@ fn run_strand_worker(
         let mut inbox: Vec<Carrier> = Vec::new();
         for (sock, tag, env) in inbox_rx.try_iter() {
             inbox.push((sock, tag, env));
+        }
+
+        // Per-strand throughput telemetry: count what this tick drained,
+        // before `inbox` is moved into the handle.
+        if !inbox.is_empty() {
+            slot.processed
+                .fetch_add(inbox.len() as u64, Ordering::Relaxed);
         }
 
         // Record arrivals into the fabric before the strand runs, so a
@@ -1771,6 +1957,13 @@ impl Bus {
     /// run. Holds no locks once returned.
     pub fn fabric_snapshot(&self) -> FabricSnapshot {
         self.kernel.fabric.lock_tolerant().snapshot()
+    }
+
+    /// Pull a [`BusStats`] telemetry snapshot — countable kernel-wide,
+    /// lifecycle, and per-strand metrics. Cheap (lock-free counters + one
+    /// fabric/slot read); callable during a run (`&self`) or after it.
+    pub fn stats(&self) -> BusStats {
+        self.kernel.stats()
     }
 
     /// Set the transfer policy at an intersection `node`. May be called

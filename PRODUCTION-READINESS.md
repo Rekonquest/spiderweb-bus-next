@@ -75,9 +75,16 @@ misbehaving, and must shut down cleanly.
   pre-advances Phase 4's fuzz target.
 
 ## Phase 2 — Observability & operability (can't run what you can't see)
-- [ ] **Structured telemetry.** Replace `spider.log(&str)` strings with
-  countable events/metrics: per-strand throughput, inbox backlog, restarts,
-  quarantines, vibration counts, edge bytes/frames. A pull-able `BusStats`.
+- [x] **Structured telemetry.** Pull-able `BusStats` (`Bus::stats()` +
+  `BusHandle::stats()` for live mid-run reads) — the countable replacement for
+  `spider.log(&str)`. Kernel-wide lock-free atomics: `delivered`,
+  `pending_evictions`, `vibrations`; lifecycle counts by kind (registered/
+  restarted/crashed/detached/quarantined/buffered/flushed/threads_formed/
+  intersections_emerged); per-strand `processed` throughput; structural
+  (active_strands, threads, intersections, nodes, edges, edge_traffic_total).
+  All `Relaxed` (observational, no decisions); `stats()` takes fabric then slots
+  locks non-nested (no deadlock — reviewed). 7 tests (`bus_stats.rs`). Edge
+  bytes/frames deferred to the Phase-3 edge-stats source.
 - [ ] **`webctl top`.** Live topology + per-node health from a running bus.
 - [ ] **Bounded-everything audit.** Confirm every map/queue is bounded.
   `THREAD_CAP`/`PENDING_BUFFER_CAP` exist; verify `positions`, `transfers`,
