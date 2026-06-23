@@ -65,9 +65,11 @@ use spiderweb::{BusHandle, Socket, Strand, StrandError};
 use std::any::TypeId;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::thread;
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 /// Drain the bridged type off the local bus and return one encoded payload
@@ -207,7 +209,9 @@ impl Edge {
         let local_addr = listener.local_addr()?;
         // Bounded: see EDGE_CHANNEL_CAP — backpressure, not unbounded growth.
         let (tx, rx) = mpsc::sync_channel::<(u64, String, Vec<u8>)>(EDGE_CHANNEL_CAP);
-        thread::spawn(move || reader_loop(listener, tx));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let reader_shutdown = shutdown.clone();
+        let reader = thread::spawn(move || reader_loop(listener, tx, reader_shutdown));
 
         let mut socks = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -220,11 +224,13 @@ impl Edge {
         }
         Ok(EdgeListener {
             name,
-            rx,
+            rx: Some(rx),
             socks,
             pushes,
             local_addr,
             delivered: 0,
+            shutdown,
+            reader: Some(reader),
         })
     }
 }
@@ -302,7 +308,11 @@ impl Strand for EdgeSender {
 /// Consuming-side bridge strand (wire -> local bus). See [`Edge::listener`].
 pub struct EdgeListener {
     name: &'static str,
-    rx: Receiver<(u64, String, Vec<u8>)>,
+    /// `Option` so `Drop` can `take()` and drop the receiver FIRST — that
+    /// disconnects the channel, instantly unblocking a reader stuck in a full
+    /// `tx.send()`, before we join it (otherwise the receiver wouldn't drop
+    /// until after `Drop` returns, deadlocking the join).
+    rx: Option<Receiver<(u64, String, Vec<u8>)>>,
     socks: Vec<Socket>,
     pushes: Vec<(&'static str, Push)>,
     local_addr: SocketAddr,
@@ -310,12 +320,62 @@ pub struct EdgeListener {
     /// re-sends already-seen seqs; we skip any `seq <= delivered` so a recovered
     /// frame is never delivered twice.
     delivered: u64,
+    /// Set on drop to tell the reader thread to stop accepting.
+    shutdown: Arc<AtomicBool>,
+    /// The background reader thread, joined on drop. `Option` so `Drop` can
+    /// `take()` it.
+    reader: Option<JoinHandle<()>>,
 }
 
 impl EdgeListener {
     /// The address actually bound (useful when binding to port 0).
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+}
+
+impl Drop for EdgeListener {
+    /// Stop the reader thread and release the bound port. Until Phase-1
+    /// graceful shutdown actually dropped strands this could never run; now it
+    /// does. The order matters:
+    ///
+    /// 1. Set the shutdown flag (`Release`, paired with the reader's `Acquire`
+    ///    loads).
+    /// 2. **Drop the receiver NOW** (`rx.take()`), disconnecting the channel so
+    ///    a reader blocked in a full `tx.send()` unblocks immediately with
+    ///    `Err`. Without this the receiver wouldn't drop until after `Drop`
+    ///    returns, and the join below would deadlock against the blocked send.
+    /// 3. Self-connect to the bound port to wake a reader blocked in
+    ///    `accept()` so it observes the flag and returns.
+    /// 4. Join the reader, which drops the `TcpListener` and frees the port.
+    ///
+    /// Promptness: a reader idle in `accept()` (the common case) or blocked on
+    /// a full `send` tears down immediately. The one slow path is a reader
+    /// mid-frame on a peer that is connected but silent: a blocking `read` can't
+    /// be cancelled in safe `std`, so it returns only when the peer disconnects
+    /// or at the `READ_TIMEOUT_SECS` (30s) slow-loris cap — so worst-case
+    /// teardown is bounded by that timeout. (At a normal shutdown the peer
+    /// disconnects, so this resolves at once.)
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        // (2) Disconnect the channel so a send-blocked reader unblocks now.
+        drop(self.rx.take());
+        // (3) Wake a blocked accept(). Connect to a loopback form of the bound
+        // address (an unspecified 0.0.0.0/:: bind isn't directly connectable).
+        let wake_addr = match self.local_addr {
+            SocketAddr::V4(a) if a.ip().is_unspecified() => {
+                SocketAddr::from((Ipv4Addr::LOCALHOST, a.port()))
+            }
+            SocketAddr::V6(a) if a.ip().is_unspecified() => {
+                SocketAddr::from((Ipv6Addr::LOCALHOST, a.port()))
+            }
+            other => other,
+        };
+        let _ = TcpStream::connect_timeout(&wake_addr, Duration::from_millis(500));
+        // (4) Join — the reader drops the TcpListener, freeing the port.
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
     }
 }
 
@@ -330,7 +390,13 @@ impl Strand for EdgeListener {
         &self.socks
     }
     fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
-        for (seq, tag, payload) in self.rx.try_iter() {
+        // `rx` is always `Some` while the strand is alive; it is only taken in
+        // `Drop`, after which `run` is never called again.
+        let frames: Vec<(u64, String, Vec<u8>)> = match &self.rx {
+            Some(rx) => rx.try_iter().collect(),
+            None => Vec::new(),
+        };
+        for (seq, tag, payload) in frames {
             // Dedup: seqs are monotonic from the sender, so a reconnect replay
             // re-sends already-seen seqs — skip them.
             if seq <= self.delivered {
@@ -350,9 +416,18 @@ impl Strand for EdgeListener {
 }
 
 /// Accept connections and stream their frames to `tx`. Re-accepts after a peer
-/// disconnects; exits when the receiver (the strand) is dropped.
-fn reader_loop(listener: TcpListener, tx: mpsc::SyncSender<(u64, String, Vec<u8>)>) {
+/// disconnects; exits when the receiver (the strand) is dropped OR when
+/// `shutdown` is set (the listener is being dropped — `Drop` self-connects to
+/// wake a blocked `accept()` so this check is reached promptly).
+fn reader_loop(
+    listener: TcpListener,
+    tx: mpsc::SyncSender<(u64, String, Vec<u8>)>,
+    shutdown: Arc<AtomicBool>,
+) {
     for conn in listener.incoming() {
+        if shutdown.load(Ordering::Acquire) {
+            return; // listener dropped: release the port (drop `listener`).
+        }
         let mut stream = match conn {
             Ok(s) => s,
             Err(_) => continue,
@@ -362,10 +437,12 @@ fn reader_loop(listener: TcpListener, tx: mpsc::SyncSender<(u64, String, Vec<u8>
         let _ = stream.set_read_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)));
         // Read frames until EOF/error/timeout, then fall through to accept the
         // next connection. `send` blocks when the bounded channel is full
-        // (backpressure) and returns Err when the strand is dropped (stop).
+        // (backpressure) and returns Err when the receiver (the strand) is
+        // dropped — which `EdgeListener::Drop` does up front, so a send-blocked
+        // reader unblocks at teardown instead of deadlocking the join.
         while let Ok(frame) = read_frame(&mut stream) {
-            if tx.send(frame).is_err() {
-                return; // strand dropped: stop.
+            if shutdown.load(Ordering::Acquire) || tx.send(frame).is_err() {
+                return; // strand/listener dropped: stop.
             }
         }
     }
@@ -586,6 +663,81 @@ mod tests {
     }
     fn dec(b: &[u8]) -> Option<String> {
         String::from_utf8(b.to_vec()).ok()
+    }
+
+    /// Dropping an `EdgeListener` must stop its reader thread and release the
+    /// bound port. Before Phase-1 graceful shutdown dropped strands, the reader
+    /// thread + bound port leaked until process exit. We bind a listener, drop
+    /// it, and require the port to be re-bindable — which only succeeds once the
+    /// reader thread has exited and dropped the `TcpListener`. `Drop` joins the
+    /// reader synchronously (waking its blocked `accept()` via self-connect), so
+    /// the port is free as soon as `drop` returns; the short retry only absorbs
+    /// OS-level release lag.
+    #[test]
+    fn dropping_the_listener_releases_the_port() {
+        let listener = Edge::new()
+            .bridge::<String>("note", "wire.note", enc, dec)
+            .listener("edge-in", "127.0.0.1:0")
+            .expect("bind listener");
+        let addr = listener.local_addr();
+
+        // Sanity: the port is bound, so a second bind to it fails right now.
+        assert!(
+            TcpListener::bind(addr).is_err(),
+            "the port should be in use while the listener is alive"
+        );
+
+        drop(listener);
+
+        let mut rebound = false;
+        for _ in 0..50 {
+            if TcpListener::bind(addr).is_ok() {
+                rebound = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            rebound,
+            "the bound port must be released after the listener is dropped (reader thread joined)"
+        );
+    }
+
+    /// Teardown must not deadlock when a peer is connected and has filled the
+    /// bounded channel while nobody is draining it (the strand's `run` isn't
+    /// being called). The reader blocks in `tx.send()`; `Drop` must drop the
+    /// receiver FIRST so that send unblocks with `Err`, letting the join
+    /// complete. A watchdog bounds the test so a regression shows up as a failed
+    /// assertion, not a hung suite.
+    #[test]
+    fn dropping_the_listener_with_a_flooding_peer_does_not_deadlock() {
+        let listener = Edge::new()
+            .bridge::<String>("note", "wire.note", enc, dec)
+            .listener("edge-in", "127.0.0.1:0")
+            .expect("bind listener");
+        let addr = listener.local_addr();
+
+        // Connect a peer and flood far more than the channel cap. Nobody is
+        // draining (the listener is not in a Bus), so the reader fills the
+        // bounded channel and then blocks in tx.send().
+        let mut peer = TcpStream::connect(addr).expect("connect peer");
+        for i in 1..=(EDGE_CHANNEL_CAP as u64 + 50) {
+            write_frame(&mut peer, i, "note", b"x").expect("write frame");
+        }
+        // Let the reader pull frames into the now-full channel and block.
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Drop on a watchdog thread; it must return promptly, not deadlock.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(listener);
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "dropping the listener with a full channel + connected peer must not deadlock"
+        );
+        drop(peer);
     }
 
     /// A message published on bus A is received by bus B across a REAL TCP
