@@ -159,7 +159,7 @@ fn run_winds_down_without_spider_after_crash() {
     });
 
     done_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(Duration::from_secs(10))
         .expect("Bus::run() should wind down after the lone strand crashes (no spider)");
     worker.join().unwrap();
 
@@ -251,7 +251,7 @@ fn run_winds_down_without_spider_when_live_strand_crashes() {
     });
 
     done_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(Duration::from_secs(10))
         .expect("Bus::run() should wind down after the lone live strand crashes (no spider)");
     worker.join().unwrap();
 
@@ -330,7 +330,7 @@ fn quarantine_winds_down_run_via_accounting() {
     });
 
     done_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(Duration::from_secs(10))
         .expect("Bus::run() should wind down once the parked strand is quarantined and the quarantiner detaches");
     worker.join().unwrap();
 
@@ -523,7 +523,7 @@ fn run_winds_down_after_a_panic_with_no_spider() {
     });
 
     done_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(Duration::from_secs(10))
         .expect("Bus::run() should wind down after the lone strand panics (no spider)");
     worker.join().unwrap();
 

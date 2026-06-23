@@ -187,6 +187,11 @@ pub struct BusStats {
     /// crashed slot awaiting the spider's decision). Always equal to
     /// `per_strand.len()` — provided for convenience.
     pub active_strands: usize,
+    /// Live subscriber registrations across all message types. Bounded: dead
+    /// subscribers are pruned lazily on the next delivery to their socket, so
+    /// crash/restart churn does not grow this without bound. Watching it stay
+    /// flat under churn is the bounded-subscriber-map invariant made visible.
+    pub subscribers: usize,
     pub threads: usize,
     pub intersections: usize,
     /// Distinct fabric vertices. Derived from [`FabricSnapshot::adjacency`], so
@@ -1500,6 +1505,15 @@ impl Kernel {
         let adj = fab.adjacency();
         let edge_traffic_total: u64 = fab.edge_traffic.iter().map(|(_, _, n)| *n).sum();
 
+        // Live subscriber count — locked separately (never nested with fabric
+        // or slots), so this adds no deadlock surface.
+        let subscribers: usize = self
+            .subscribers
+            .lock_tolerant()
+            .values()
+            .map(|v| v.len())
+            .sum();
+
         let mut per_strand: Vec<StrandStats> = self
             .slots
             .lock_tolerant()
@@ -1526,6 +1540,7 @@ impl Kernel {
             threads_formed: s.threads_formed.load(Ordering::Relaxed),
             intersections_emerged: s.intersections_emerged.load(Ordering::Relaxed),
             active_strands,
+            subscribers,
             threads: fab.threads.len(),
             intersections: fab.intersections.len(),
             nodes: adj.nodes.len(),
@@ -1628,6 +1643,7 @@ impl Kernel {
 
         // Send to the snapshot outside the locks. Each subscriber gets
         // its own clone carrying its (possibly forked) tag.
+        let mut dead: Vec<Arc<Subscriber>> = Vec::new();
         for (sub, sub_tag) in snapshot.iter().zip(sub_tags) {
             let cloned = registry().as_ref().unwrap().clone_env(&env);
             if let Err(returned) = sub.try_send(socket, sub_tag, cloned) {
@@ -1637,6 +1653,21 @@ impl Kernel {
                     sub.name
                 );
                 let _ = returned;
+                dead.push(sub.clone());
+            }
+        }
+        // Prune disconnected subscribers so crash/restart churn cannot grow the
+        // subscriber map (or per-delivery cost) without bound: every restart
+        // installs a fresh subscriber, and the old one's receiver is dropped
+        // when its worker exits, leaving a dead entry that nothing else removes.
+        // A disconnected subscriber's receiver is gone, so dropping it loses no
+        // message, and we match by Arc identity so a live or newly-subscribed
+        // entry is never touched. Only runs when a send actually failed, so the
+        // steady-state hot path pays nothing.
+        if !dead.is_empty() {
+            let mut subs = self.subscribers.lock_tolerant();
+            if let Some(list) = subs.get_mut(&type_id) {
+                list.retain(|s| !dead.iter().any(|d| Arc::ptr_eq(s, d)));
             }
         }
         // Telemetry: count physical deliveries (one per subscriber), and
