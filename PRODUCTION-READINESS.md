@@ -113,8 +113,17 @@ misbehaving, and must shut down cleanly.
   doesn't flake under parallel load.)
 
 ## Phase 3 — Edge transport to production (the distributed story)
-- [ ] **Clean teardown.** `EdgeListener::Drop` stops its reader thread (needs
-  Phase 1 graceful shutdown so the strand is actually dropped).
+- [x] **Clean teardown.** `EdgeListener::Drop` stops its reader thread and
+  releases the bound port (now that Phase-1 graceful shutdown actually drops the
+  strand). Drop order: set the shutdown flag (`Release`/`Acquire`), **drop the
+  receiver first** (unblocks a reader stuck in a full `tx.send()` — the
+  deadlock an independent review caught), self-connect to wake a reader blocked
+  in `accept()`, then join (which drops the `TcpListener`, freeing the port).
+  Prompt in the idle/full-channel cases; a silent-peer-mid-read is bounded by
+  the 30s slow-loris cap (a blocking `read` can't be cancelled in safe std —
+  documented). Tests: `dropping_the_listener_releases_the_port`,
+  `dropping_the_listener_with_a_flooding_peer_does_not_deadlock` (watchdog-
+  bounded). Reviewed (single-agent; CRITICAL deadlock found + fixed).
 - [ ] **Authenticity/integrity.** Per-frame MAC (keyed hash) — reject forged/
   tampered frames. (Introduces the first crypto dependency at the edge.)
 - [ ] **Confidentiality.** TLS (rustls) — or an explicit, documented
