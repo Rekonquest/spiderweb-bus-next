@@ -1362,8 +1362,7 @@ impl Kernel {
 
         kernel
             .subscribers
-            .lock()
-            .unwrap()
+            .lock_tolerant()
             .entry(TypeId::of::<ControlMsg>())
             .or_default()
             .push(sub);
@@ -1890,9 +1889,29 @@ fn run_strand_worker(
         // done_count. Catch it and treat it exactly like an explicit crash.
         // (Relies on unwinding panics; `panic = "abort"` is uncatchable, by
         // design — document that for production deployers.)
-        let outcome =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| strand.run(&mut handle)));
-        let panicked = outcome.is_err();
+        //
+        // The outbox delivery runs INSIDE this boundary too: fan-out cloning
+        // (`kernel.deliver` -> `clone_env`) panics if a strand publishes a type
+        // that was never `register_clone_type`'d. Delivering outside the
+        // `catch_unwind` would let that panic kill the worker silently — no
+        // Crashed event, no WorkerExit — and hang `Bus::run()`. Inside, it
+        // becomes the same clean Crashed path as any other strand panic.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let r = strand.run(&mut handle);
+            // run() returned WITHOUT panicking — flush this tick's outbox. A
+            // clean `Detach` or an explicit `Crashed` return still delivers the
+            // work it produced this tick (e.g. a source that publishes then
+            // detaches in the same tick), matching the pre-isolation behavior.
+            // A PANIC in run() unwinds before this point, so a half-built outbox
+            // from a panicked run is never delivered. A panic DURING delivery
+            // (e.g. `clone_env` on an unregistered fan-out type) is caught too
+            // and becomes a clean Crashed, instead of a silent worker death.
+            let outbox = handle.take_outbox();
+            for (socket, tag, env) in outbox {
+                kernel.deliver(socket, tag, env, &name);
+            }
+            r
+        }));
         let result = match outcome {
             Ok(r) => r,
             Err(payload) => {
@@ -1910,15 +1929,6 @@ fn run_strand_worker(
                 Err(StrandError::Crashed(format!("panicked: {}", msg)))
             }
         };
-
-        // Deliver this tick's output — but NEVER a half-built outbox from a
-        // panicked run (its work did not complete and may be inconsistent).
-        if !panicked {
-            let outbox = handle.take_outbox();
-            for (socket, tag, env) in outbox {
-                kernel.deliver(socket, tag, env, &name);
-            }
-        }
 
         match result {
             Ok(()) => {
@@ -2153,8 +2163,7 @@ impl Bus {
                             // directly from the message.
                             let factory_opt = kernel
                                 .slots
-                                .lock()
-                                .unwrap()
+                                .lock_tolerant()
                                 .get(name.as_str())
                                 .and_then(|s| s.factory.clone());
                             match factory_opt {
@@ -2645,6 +2654,63 @@ mod tests {
         // Idempotent: registering twice is a no-op because the
         // registry overwrites. We just verify it doesn't panic.
         register_clone_type::<CustomPayload>();
+    }
+
+    /// Publishing a type that was never `register_clone_type`'d makes the
+    /// fan-out clone (`clone_env`) panic — but that panic fires during the
+    /// worker's OUTBOX DELIVERY, not inside `strand.run()`. The delivery loop
+    /// must sit inside the same `catch_unwind` boundary as `run`, so the
+    /// panic becomes a clean `Crashed` lifecycle event instead of silently
+    /// killing the worker — which would skip the Crashed count and, under
+    /// `Bus::run()`, hang the bus forever on a slot that never reports done.
+    /// Regression for the "outbox delivered outside catch_unwind" hole.
+    #[test]
+    fn unregistered_fan_out_type_becomes_clean_crashed_not_silent_death() {
+        // Registered nowhere, so `clone_env` has no entry and the very first
+        // delivery panics. Local to this test so no other test can register
+        // it in the process-global clone registry and mask the panic.
+        #[derive(Clone)]
+        struct NeverRegistered;
+
+        struct Boom {
+            fired: bool,
+        }
+        impl Strand for Boom {
+            fn name(&self) -> &str {
+                "boom"
+            }
+            fn inputs(&self) -> &[Socket] {
+                &[]
+            }
+            fn outputs(&self) -> &[Socket] {
+                const SK: Socket = Socket::new::<NeverRegistered>("boom.out");
+                std::slice::from_ref(&SK)
+            }
+            fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+                // Publish once. The panic happens when the kernel delivers it
+                // (the replay-buffer clone runs even with zero subscribers).
+                if !self.fired {
+                    self.fired = true;
+                    bus.publish("boom.out", NeverRegistered)?;
+                }
+                bus.sleep(Duration::from_millis(10));
+                Ok(())
+            }
+        }
+
+        let mut bus = Bus::open();
+        bus.register(Boom { fired: false });
+        // Bounded run so a regressed (silent-death) build still terminates via
+        // the timeout — but then `crashed` would be 0, which is the failure we
+        // assert against. With the fix the delivery panic is contained+counted.
+        bus.run_until(Some(Duration::from_millis(300)));
+
+        assert!(
+            bus.stats().crashed >= 1,
+            "an unregistered fan-out type must surface as a Crashed lifecycle \
+             event (outbox delivery inside catch_unwind), got crashed={}",
+            bus.stats().crashed
+        );
     }
 
     // ----- Integration tests (Bus-level) -----------------------------------

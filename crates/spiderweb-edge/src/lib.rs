@@ -109,6 +109,12 @@ const READ_TIMEOUT_SECS: u64 = 30;
 /// (re)connect. Recovers losses up to this many frames of disconnect; worst-
 /// case retained bytes ≈ `RING_CAP * MAX_PAYLOAD`.
 const RING_CAP: usize = 256;
+/// How many distinct sender sessions the listener tracks high-waters for at
+/// once (oldest evicted when full). >1 so session OSCILLATION (a session
+/// briefly reappearing, or two senders sharing one listener) resumes each
+/// session's own mark instead of resetting to 0 and re-delivering its ring;
+/// bounded so a stream of distinct sessions can't grow the tracker forever.
+const SESSION_TRACK: usize = 16;
 
 /// A peer link configuration: which types bridge across the wire and how each
 /// serializes. Build it the same way on both ends, then call [`Edge::sender`]
@@ -249,8 +255,7 @@ impl Edge {
             socks,
             pushes,
             local_addr,
-            session: 0,
-            delivered: 0,
+            sessions: Vec::new(),
             shutdown,
             reader: Some(reader),
         })
@@ -342,13 +347,16 @@ pub struct EdgeListener {
     socks: Vec<Socket>,
     pushes: Vec<(&'static str, Push)>,
     local_addr: SocketAddr,
-    /// The sender session currently being tracked (0 = none yet). A frame from a
-    /// NEW session resets `delivered` — that is what recovers a restarted sender.
-    session: u64,
-    /// High-water mark of delivered sequence numbers WITHIN `session`. A
-    /// reconnect replay re-sends already-seen seqs; we skip any `seq <=
-    /// delivered` so a recovered frame is never delivered twice.
-    delivered: u64,
+    /// Per-session delivery high-water marks `(session, high_water)`, one entry
+    /// per recently-seen sender session, oldest first. A frame's `seq` is
+    /// delivered only if it exceeds its OWN session's mark — so a reconnect
+    /// replay is deduped, a restarted sender (new session, seqs reset to 1) is
+    /// recovered (its mark starts at 0), and a session that briefly reappears
+    /// (oscillation A→B→A, or two senders on one listener) resumes its prior
+    /// mark instead of resetting to 0 and re-delivering its whole ring as
+    /// duplicates. Bounded to `SESSION_TRACK` (oldest evicted) so a churn of
+    /// distinct sessions can't grow it without limit.
+    sessions: Vec<(u64, u64)>,
     /// Set on drop to tell the reader thread to stop accepting.
     shutdown: Arc<AtomicBool>,
     /// The background reader thread, joined on drop. `Option` so `Drop` can
@@ -426,19 +434,28 @@ impl Strand for EdgeListener {
             None => Vec::new(),
         };
         for (session, seq, tag, payload) in frames {
-            // A new sender session (e.g. a sender RESTART, which resets seqs to
-            // 1) resets the dedup high-water — otherwise those reset seqs would
-            // be skipped against the old session's mark (the blackout).
-            if session != self.session {
-                self.session = session;
-                self.delivered = 0;
-            }
+            // Resolve this frame to its OWN session's high-water, tracking a
+            // newly-seen session (evicting the oldest if the bounded set is
+            // full). A restarted sender arrives as a new session (mark 0, so its
+            // reset seqs deliver — recovery, not blackout); a returning session
+            // resumes its existing mark, so oscillation can't re-deliver a ring.
+            let idx = match self.sessions.iter().position(|(s, _)| *s == session) {
+                Some(i) => i,
+                None => {
+                    if self.sessions.len() >= SESSION_TRACK {
+                        self.sessions.remove(0); // evict oldest-tracked session
+                    }
+                    self.sessions.push((session, 0));
+                    self.sessions.len() - 1
+                }
+            };
             // Dedup: seqs are monotonic within a session, so a reconnect replay
-            // re-sends already-seen seqs — skip them.
-            if seq <= self.delivered {
+            // re-sends already-seen seqs — skip any at or below this session's
+            // mark.
+            if seq <= self.sessions[idx].1 {
                 continue;
             }
-            self.delivered = seq;
+            self.sessions[idx].1 = seq;
             for (t, push) in &self.pushes {
                 if *t == tag {
                     push(bus, &payload);
@@ -490,9 +507,26 @@ fn write_frame<W: Write>(
     tag: &str,
     payload: &[u8],
 ) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    let tag_b = tag.as_bytes();
+    // Enforce the SAME caps the reader enforces, on the write side. The length
+    // prefixes are `u32`; an oversized tag/payload would truncate on the cast
+    // and desync the stream (the receiver mis-frames the next bytes). Refuse it
+    // instead — defensive symmetry with read_frame's bounds checks.
+    if tag_b.len() > MAX_TAG {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "edge: tag exceeds MAX_TAG",
+        ));
+    }
+    if payload.len() > MAX_PAYLOAD {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "edge: payload exceeds MAX_PAYLOAD",
+        ));
+    }
     w.write_all(&session.to_be_bytes())?;
     w.write_all(&seq.to_be_bytes())?;
-    let tag_b = tag.as_bytes();
     w.write_all(&(tag_b.len() as u32).to_be_bytes())?;
     w.write_all(tag_b)?;
     w.write_all(&(payload.len() as u32).to_be_bytes())?;
@@ -903,6 +937,79 @@ mod tests {
             got,
             vec!["a1", "a2", "a3", "b1", "b2"],
             "expected exactly the 5 messages across the restart"
+        );
+    }
+
+    /// Session OSCILLATION must not re-deliver. After session A (1,2,3) then
+    /// session B (1,2), session A RECONNECTS and replays its whole ring (1,2,3
+    /// again) — the case where two senders share one listener, or a restart
+    /// reuses an earlier session id. A single `(session, delivered)` pair would
+    /// reset to 0 on the return to A and re-deliver a1/a2/a3 as DUPLICATES (an
+    /// exactly-once violation). The per-session high-water remembers A's mark
+    /// (3), so the replay delivers nothing new. Regression for the bounded
+    /// per-session dedup map.
+    #[test]
+    fn oscillating_sessions_do_not_re_deliver_a_replayed_ring() {
+        use std::io::Write as _;
+        let collected = Arc::new(Mutex::new(Vec::<String>::new()));
+        let listener = Edge::new()
+            .bridge::<String>("note", "wire.note", enc, dec)
+            .listener("edge-in", "127.0.0.1:0")
+            .expect("bind listener");
+        let port = listener.local_addr().port();
+        let c = collected.clone();
+        let bus_thread = thread::spawn(move || {
+            let mut bus = Bus::open();
+            bus.register(listener);
+            bus.register(Collector { sink: c });
+            bus.run_until(Some(Duration::from_millis(1200)));
+        });
+        thread::sleep(Duration::from_millis(80)); // let the reader thread start
+
+        // Session A: seqs 1,2,3 -> high-water 3.
+        {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect A");
+            for (seq, p) in [(1u64, "a1"), (2, "a2"), (3, "a3")] {
+                write_frame(&mut s, 100, seq, "note", p.as_bytes()).expect("write A");
+            }
+            let _ = s.flush();
+        }
+        thread::sleep(Duration::from_millis(140));
+
+        // Session B: seqs 1,2.
+        {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect B");
+            for (seq, p) in [(1u64, "b1"), (2, "b2")] {
+                write_frame(&mut s, 200, seq, "note", p.as_bytes()).expect("write B");
+            }
+            let _ = s.flush();
+        }
+        thread::sleep(Duration::from_millis(140));
+
+        // Session A RECONNECTS and replays its entire ring (1,2,3 again).
+        {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).expect("reconnect A");
+            for (seq, p) in [(1u64, "a1"), (2, "a2"), (3, "a3")] {
+                write_frame(&mut s, 100, seq, "note", p.as_bytes()).expect("rewrite A");
+            }
+            let _ = s.flush();
+        }
+        thread::sleep(Duration::from_millis(240));
+        bus_thread.join().unwrap();
+
+        let got = collected.lock().unwrap().clone();
+        // The A-replay must add NOTHING: exactly the 5 distinct messages, no dup.
+        assert_eq!(
+            got.len(),
+            5,
+            "session oscillation re-delivered a replayed ring (duplicates): {got:?}"
+        );
+        let mut sorted = got;
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec!["a1", "a2", "a3", "b1", "b2"],
+            "expected exactly the 5 distinct messages, each once"
         );
     }
 
