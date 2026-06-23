@@ -155,7 +155,10 @@ where
         F: Fn(I) -> O + Send + Sync + 'static,
     {
         assert!(lanes >= 1, "a highway needs at least one lane");
-        assert!(capacity >= 1, "a highway needs capacity for at least one item");
+        assert!(
+            capacity >= 1,
+            "a highway needs capacity for at least one item"
+        );
 
         let f: LaneFn<I, O> = Arc::new(f);
         let (job_tx, job_rx) = mpsc::channel::<(Tag, I)>();

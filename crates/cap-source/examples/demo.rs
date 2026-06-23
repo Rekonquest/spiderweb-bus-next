@@ -9,9 +9,9 @@
 //!
 //! Runs for 5 seconds, then shuts down cleanly.
 
-use spiderweb::Bus;
-use cap_source::CapSource;
 use cap_sink::CapSink;
+use cap_source::CapSource;
+use spiderweb::Bus;
 use std::time::Duration;
 
 fn main() {

@@ -88,10 +88,8 @@ pub fn heat_propagate(
     let mut a: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
     let mut degree: Vec<f64> = vec![0.0; n];
     for edge in &adjacency.edges {
-        let (Some(&i), Some(&j)) = (
-            index.get(edge.from.as_str()),
-            index.get(edge.to.as_str()),
-        ) else {
+        let (Some(&i), Some(&j)) = (index.get(edge.from.as_str()), index.get(edge.to.as_str()))
+        else {
             continue;
         };
         a[i].push((j, edge.conductance));
@@ -189,7 +187,10 @@ mod tests {
     }
 
     fn felt(prop: &[(NodeId, f64)], node: &str) -> f64 {
-        prop.iter().find(|(n, _)| n == node).map(|(_, v)| *v).unwrap()
+        prop.iter()
+            .find(|(n, _)| n == node)
+            .map(|(_, v)| *v)
+            .unwrap()
     }
 
     /// At t=0, no diffusion: source carries all the mass, everyone else is 0.
@@ -215,6 +216,56 @@ mod tests {
             let prop = heat_propagate(&a, "A", t, DEFAULT_K);
             let total: f64 = prop.iter().map(|(_, v)| v).sum();
             assert!((total - 1.0).abs() < 1e-9, "t={t} total={total}");
+        }
+    }
+
+    /// PROPERTY: mass conservation holds on RANDOM graphs, not just a path.
+    /// For a symmetric Laplacian `L = D − A`, `L·1 = 0`, so `exp(−tL)` is
+    /// doubly stochastic and any column sums to 1 — for ANY graph, connected or
+    /// not. We hammer thousands of random topologies/conductances at small `t`
+    /// (kept well inside the truncated-Taylor convergence radius with
+    /// `DEFAULT_K`) and assert the source column always sums to 1. If this ever
+    /// fails, the generator is producing physically meaningless attenuation.
+    #[test]
+    fn mass_conservation_property_on_random_graphs() {
+        let mut s: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut rng = || {
+            s ^= s >> 12;
+            s ^= s << 25;
+            s ^= s >> 27;
+            s.wrapping_mul(0x2545F4914F6CDD1D)
+        };
+        let names = ["A", "B", "C", "D", "E", "F", "G", "H"];
+        for _ in 0..3000 {
+            let n = 2 + (rng() % 7) as usize; // 2..=8 nodes
+            let nodes: Vec<&str> = names[..n].to_vec();
+            let mut edges: Vec<(&str, &str, f64)> = Vec::new();
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    if rng() % 100 < 45 {
+                        // conductance in [0.5, 2.0]
+                        let c = 0.5 + (rng() % 1500) as f64 / 1000.0;
+                        edges.push((names[i], names[j], c));
+                    }
+                }
+            }
+            let a = adj(&nodes, &edges);
+            // small t keeps t*max_degree inside the K-term Taylor radius.
+            for t in [0.005, 0.01, 0.02] {
+                let prop = heat_propagate(&a, nodes[0], t, DEFAULT_K);
+                let total: f64 = prop.iter().map(|(_, v)| v).sum();
+                assert!(
+                    (total - 1.0).abs() < 1e-6,
+                    "mass not conserved: n={n} t={t} total={total} edges={edges:?}"
+                );
+                // every felt-strength is a valid probability mass in [0, 1].
+                for (node, v) in &prop {
+                    assert!(
+                        *v >= -1e-9 && *v <= 1.0 + 1e-9,
+                        "felt strength out of [0,1]: {node}={v}"
+                    );
+                }
+            }
         }
     }
 
@@ -278,7 +329,10 @@ mod tests {
         let t = 0.05;
         let b_thin = felt(&heat_propagate(&thin, "A", t, DEFAULT_K), "B");
         let b_worn = felt(&heat_propagate(&worn, "A", t, DEFAULT_K), "B");
-        assert!(b_worn > b_thin, "worn ({b_worn}) should exceed thin ({b_thin})");
+        assert!(
+            b_worn > b_thin,
+            "worn ({b_worn}) should exceed thin ({b_thin})"
+        );
     }
 
     /// Empty graph → empty result. An unknown source → empty result. Both
@@ -300,7 +354,10 @@ mod tests {
         let prop = heat_propagate(&a, "A", 0.1, DEFAULT_K);
         for (node, expected) in &prop {
             let scalar = heat_attenuation(&a, "A", node, 0.1, DEFAULT_K).unwrap();
-            assert!((scalar - expected).abs() < 1e-12, "{node}: {scalar} vs {expected}");
+            assert!(
+                (scalar - expected).abs() < 1e-12,
+                "{node}: {scalar} vs {expected}"
+            );
         }
         assert_eq!(heat_attenuation(&a, "A", "ghost", 0.1, DEFAULT_K), None);
         assert_eq!(heat_attenuation(&a, "ghost", "A", 0.1, DEFAULT_K), None);
@@ -319,7 +376,10 @@ mod tests {
         };
         let b = heat_attenuation_default(&snap, "A", "B", 0.1).unwrap();
         let c = heat_attenuation_default(&snap, "A", "C", 0.1).unwrap();
-        assert!(b > c, "B (1 hop, conductance 3) should beat C (2 hops, conductance 1)");
+        assert!(
+            b > c,
+            "B (1 hop, conductance 3) should beat C (2 hops, conductance 1)"
+        );
         assert!(c > 0.0, "C should still feel something through the chain");
     }
 }

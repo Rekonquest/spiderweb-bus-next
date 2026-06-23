@@ -27,8 +27,16 @@ fn main() {
         .map(|s| s.to_string())
         .collect();
     let edges = vec![
-        FabricEdge { from: "source".into(), to: "relay".into(), conductance: 10.0 },
-        FabricEdge { from: "relay".into(), to: "depot".into(), conductance: 1.0 },
+        FabricEdge {
+            from: "source".into(),
+            to: "relay".into(),
+            conductance: 10.0,
+        },
+        FabricEdge {
+            from: "relay".into(),
+            to: "depot".into(),
+            conductance: 1.0,
+        },
         // neighbor: present in the vertex set but UNCONNECTED.
     ];
     let adjacency = FabricAdjacency { nodes, edges };
@@ -63,10 +71,16 @@ fn main() {
     }
 
     println!("\nWhat the contrast shows:");
-    println!("  • neighbor is CLOSE in 3D ({} from source) → Euclidean rates it high.", 1.0_f64);
+    println!(
+        "  • neighbor is CLOSE in 3D ({} from source) → Euclidean rates it high.",
+        1.0_f64
+    );
     println!("    But it has NO EDGE — the graph kernel correctly reports 0.0 (vibrations");
     println!("    can't reach it through any strand). The painted Euclidean lies.");
-    println!("  • depot is FAR in 3D ({} from source) → Euclidean rates it low.", 10.0_f64);
+    println!(
+        "  • depot is FAR in 3D ({} from source) → Euclidean rates it low.",
+        10.0_f64
+    );
     println!("    But the graph connects them through 'relay' with a WORN (c=10) edge,");
     println!("    so the heat kernel reports a real share of the source's vibration");
     println!("    arriving — through the actual fabric, weighted by real traffic.");

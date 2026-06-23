@@ -369,14 +369,20 @@ mod tests {
         let snap = FabricSnapshot {
             positions: vec![
                 ("ok".to_string(), Position::new(1.0, 2.0, 3.0)),
-                ("bad".to_string(), Position::new(f64::NAN, f64::INFINITY, 0.0)),
+                (
+                    "bad".to_string(),
+                    Position::new(f64::NAN, f64::INFINITY, 0.0),
+                ),
             ],
             ..Default::default()
         };
         let json = scene_json(&snap);
         assert!(json.contains("\"name\":\"ok\""), "finite node kept");
         assert!(!json.contains("bad"), "non-finite node dropped");
-        assert!(!json.contains("NaN") && !json.contains("inf"), "no invalid JSON tokens");
+        assert!(
+            !json.contains("NaN") && !json.contains("inf"),
+            "no invalid JSON tokens"
+        );
     }
 
     /// The `top` dashboard renders the header, the counters, and a per-strand
@@ -394,8 +400,14 @@ mod tests {
             edges: 1,
             threads: 4,
             per_strand: vec![
-                spiderweb::StrandStats { name: "sink".into(), processed: 100 },
-                spiderweb::StrandStats { name: "source".into(), processed: 42 },
+                spiderweb::StrandStats {
+                    name: "sink".into(),
+                    processed: 100,
+                },
+                spiderweb::StrandStats {
+                    name: "source".into(),
+                    processed: 42,
+                },
             ],
             ..Default::default()
         };
@@ -403,8 +415,14 @@ mod tests {
         assert!(out.contains("spiderweb top"), "has a header");
         assert!(out.contains("1234"), "shows delivered count");
         assert!(out.contains("crash 2"), "shows lifecycle crash count");
-        assert!(out.contains("sink") && out.contains("100"), "shows a per-strand row");
-        assert!(out.contains("source") && out.contains("42"), "shows the other strand");
+        assert!(
+            out.contains("sink") && out.contains("100"),
+            "shows a per-strand row"
+        );
+        assert!(
+            out.contains("source") && out.contains("42"),
+            "shows the other strand"
+        );
     }
 
     /// With no strands the dashboard still renders (no panic, shows a marker).

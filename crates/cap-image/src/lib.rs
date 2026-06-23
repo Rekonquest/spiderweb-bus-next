@@ -86,10 +86,7 @@ pub struct CapImageSource {
 
 impl CapImageSource {
     pub fn new(requests: Vec<ImageRequest>) -> Self {
-        CapImageSource {
-            requests,
-            index: 0,
-        }
+        CapImageSource { requests, index: 0 }
     }
 }
 
@@ -114,7 +111,12 @@ impl Strand for CapImageSource {
         }
         let req = self.requests[self.index].clone();
         self.index += 1;
-        bus.log(&format!("→ request #{}/{}: {}", self.index, self.requests.len(), req.0));
+        bus.log(&format!(
+            "→ request #{}/{}: {}",
+            self.index,
+            self.requests.len(),
+            req.0
+        ));
         bus.publish("in.image.request", req)?;
         bus.sleep(Duration::from_millis(200));
         Ok(())
@@ -341,13 +343,8 @@ fn save_to(path: &str, result: &ImageResult) -> Result<(), String> {
     let bytes = STANDARD
         .decode(&result.rgba_b64)
         .map_err(|e| format!("base64 decode: {}", e))?;
-    let dyn_img = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
-        result.width,
-        result.height,
-        bytes,
-    )
-    .ok_or_else(|| "from_raw failed".to_string())?;
-    dyn_img
-        .save(path)
-        .map_err(|e| format!("save: {}", e))
+    let dyn_img =
+        image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(result.width, result.height, bytes)
+            .ok_or_else(|| "from_raw failed".to_string())?;
+    dyn_img.save(path).map_err(|e| format!("save: {}", e))
 }

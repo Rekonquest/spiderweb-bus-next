@@ -118,18 +118,42 @@ pub enum LifecycleEvent {
         inputs: Vec<String>,
         outputs: Vec<String>,
     },
-    Detached { name: String },
-    Crashed { name: String, reason: String },
-    Restarted { name: String, attempt: u32 },
-    Quarantined { name: String, reason: String },
-    Buffered { socket: &'static str, from: String },
-    Flushed { socket: &'static str, to: String, count: usize },
+    Detached {
+        name: String,
+    },
+    Crashed {
+        name: String,
+        reason: String,
+    },
+    Restarted {
+        name: String,
+        attempt: u32,
+    },
+    Quarantined {
+        name: String,
+        reason: String,
+    },
+    Buffered {
+        socket: &'static str,
+        from: String,
+    },
+    Flushed {
+        socket: &'static str,
+        to: String,
+        count: usize,
+    },
     /// A new thread (desire path) was born — a message with no parent
     /// entered the fabric at `origin`. v1.3.
-    ThreadFormed { thread: ThreadId, origin: NodeId },
+    ThreadFormed {
+        thread: ThreadId,
+        origin: NodeId,
+    },
     /// An intersection emerged: `node` is where the fabric first
     /// observed two distinct threads cross. v1.3.
-    IntersectionEmerged { node: NodeId, threads: Vec<ThreadId> },
+    IntersectionEmerged {
+        node: NodeId,
+        threads: Vec<ThreadId>,
+    },
 }
 
 // -----------------------------------------------------------------------------
@@ -216,13 +240,21 @@ pub struct BusStats {
 
 #[derive(Debug, Clone)]
 pub enum ControlMsg {
-    Restart { name: String },
-    Quarantine { name: String, reason: String },
+    Restart {
+        name: String,
+    },
+    Quarantine {
+        name: String,
+        reason: String,
+    },
     Shutdown,
     /// Set the transfer policy at an intersection `node`. Lets Layer-3
     /// orchestration (the spider) govern how threads hop at a crossing
     /// without any strand knowing. v1.3.
-    SetTransfer { node: NodeId, policy: TransferPolicy },
+    SetTransfer {
+        node: NodeId,
+        policy: TransferPolicy,
+    },
 }
 
 // -----------------------------------------------------------------------------
@@ -332,7 +364,11 @@ pub struct Position {
 }
 
 impl Position {
-    pub const ORIGIN: Position = Position { x: 0.0, y: 0.0, z: 0.0 };
+    pub const ORIGIN: Position = Position {
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+    };
 
     pub const fn new(x: f64, y: f64, z: f64) -> Self {
         Position { x, y, z }
@@ -610,7 +646,13 @@ impl Fabric {
         let prefix = self.threads.get(&parent)?.direction.clone();
         let id = self.next_thread;
         self.next_thread += 1;
-        self.threads.insert(id, Thread { id, direction: prefix });
+        self.threads.insert(
+            id,
+            Thread {
+                id,
+                direction: prefix,
+            },
+        );
         self.evict_if_needed();
         Some(id)
     }
@@ -793,8 +835,11 @@ impl Fabric {
         threads.sort_by_key(|t| t.id);
         let mut intersections: Vec<Intersection> = self.intersections.values().cloned().collect();
         intersections.sort_by(|a, b| a.node.cmp(&b.node));
-        let mut positions: Vec<(NodeId, Position)> =
-            self.positions.iter().map(|(n, p)| (n.clone(), *p)).collect();
+        let mut positions: Vec<(NodeId, Position)> = self
+            .positions
+            .iter()
+            .map(|(n, p)| (n.clone(), *p))
+            .collect();
         positions.sort_by(|a, b| a.0.cmp(&b.0));
         let mut edge_traffic: Vec<(NodeId, NodeId, u64)> = self
             .edge_traffic
@@ -995,7 +1040,8 @@ impl BusHandle {
         socket: &'static str,
         value: T,
     ) -> Result<(), BusError> {
-        self.outbox.push((socket, self.current_cause, Box::new(value)));
+        self.outbox
+            .push((socket, self.current_cause, Box::new(value)));
         Ok(())
     }
 
@@ -1170,7 +1216,11 @@ impl fmt::Display for BusError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BusError::TypeMismatch { socket, expected } => {
-                write!(f, "type mismatch on socket `{}` (expected {})", socket, expected)
+                write!(
+                    f,
+                    "type mismatch on socket `{}` (expected {})",
+                    socket, expected
+                )
             }
         }
     }
@@ -1415,11 +1465,7 @@ impl Kernel {
     /// Restart an existing slot using its stored factory. Returns
     /// the new slot (caller inserts it into the map). If the slot
     /// has no factory (live strand), returns `None`.
-    fn restart_slot(
-        self: &Arc<Self>,
-        name: &str,
-        factory: StrandFactory,
-    ) -> Arc<StrandSlot> {
+    fn restart_slot(self: &Arc<Self>, name: &str, factory: StrandFactory) -> Arc<StrandSlot> {
         self.install_slot(name, Some(factory))
     }
 
@@ -1616,8 +1662,7 @@ impl Kernel {
             }
             buf.push((socket, out_tag, buffered));
 
-            let snapshot: Vec<Arc<Subscriber>> =
-                subs.get(&type_id).cloned().unwrap_or_default();
+            let snapshot: Vec<Arc<Subscriber>> = subs.get(&type_id).cloned().unwrap_or_default();
             (snapshot, was_empty)
         };
 
@@ -1776,8 +1821,16 @@ fn run_strand_worker(
     let gen = slot.generation.load(std::sync::atomic::Ordering::SeqCst);
 
     if gen == 1 {
-        let inputs: Vec<String> = strand.inputs().iter().map(|s| s.name().to_string()).collect();
-        let outputs: Vec<String> = strand.outputs().iter().map(|s| s.name().to_string()).collect();
+        let inputs: Vec<String> = strand
+            .inputs()
+            .iter()
+            .map(|s| s.name().to_string())
+            .collect();
+        let outputs: Vec<String> = strand
+            .outputs()
+            .iter()
+            .map(|s| s.name().to_string())
+            .collect();
         println!(
             "[{:>5}ms] [kernel] 🕸️  {} registered ({} inputs, {} outputs)",
             kernel.boot.elapsed().as_millis(),
@@ -1946,9 +1999,7 @@ impl Bus {
         self.detect_collision_str(spec.name);
         let mut spider_name = self.kernel.spider_name.lock_tolerant();
         if spider_name.is_some() {
-            panic!(
-                "register_spider called twice; only one spider is supported in v1.2"
-            );
+            panic!("register_spider called twice; only one spider is supported in v1.2");
         }
         *spider_name = Some(spec.name.to_string());
         drop(spider_name);
@@ -2008,7 +2059,10 @@ impl Bus {
     /// observational unless explicitly governed here or via
     /// [`ControlMsg::SetTransfer`].
     pub fn set_transfer(&mut self, node: &str, policy: TransferPolicy) {
-        self.kernel.fabric.lock_tolerant().set_transfer(node, policy);
+        self.kernel
+            .fabric
+            .lock_tolerant()
+            .set_transfer(node, policy);
     }
 
     /// Place `node` at a position in the web's 3D space. Pure metadata —
@@ -2070,9 +2124,11 @@ impl Bus {
 
         // Read the control_rx out of the kernel so we can poll it
         // in the main loop.
-        let control_rx = kernel.control_rx.lock_tolerant().take().expect(
-            "kernel control channel already taken; this is a bug in the kernel",
-        );
+        let control_rx = kernel
+            .control_rx
+            .lock_tolerant()
+            .take()
+            .expect("kernel control channel already taken; this is a bug in the kernel");
 
         'run: loop {
             if let Some(d) = max_duration {
@@ -2204,8 +2260,7 @@ impl Bus {
                         // down when its strands die instead of hanging
                         // forever. This is accounting, not policy — the
                         // kernel still restarts nothing on its own.
-                        let has_spider =
-                            kernel.spider_name.lock_tolerant().is_some();
+                        let has_spider = kernel.spider_name.lock_tolerant().is_some();
                         if !has_spider {
                             kernel.slots.lock_tolerant().remove(name);
                             done_count += 1;
@@ -2364,8 +2419,12 @@ mod tests {
     }
 
     impl Strand for TestSource {
-        fn name(&self) -> &str { "test-source" }
-        fn inputs(&self) -> &[Socket] { &[] }
+        fn name(&self) -> &str {
+            "test-source"
+        }
+        fn inputs(&self) -> &[Socket] {
+            &[]
+        }
         fn outputs(&self) -> &[Socket] {
             const SOCK: Socket = Socket::new::<String>("out.test");
             std::slice::from_ref(&SOCK)
@@ -2395,7 +2454,11 @@ mod tests {
             let count = Arc::new(AtomicU32::new(0));
             let last = Arc::new(Mutex::new(String::new()));
             (
-                TestSink { tag, count: count.clone(), last: last.clone() },
+                TestSink {
+                    tag,
+                    count: count.clone(),
+                    last: last.clone(),
+                },
                 count,
                 last,
             )
@@ -2403,12 +2466,16 @@ mod tests {
     }
 
     impl Strand for TestSink {
-        fn name(&self) -> &str { self.tag }
+        fn name(&self) -> &str {
+            self.tag
+        }
         fn inputs(&self) -> &[Socket] {
             const SOCK: Socket = Socket::new::<String>("in.test");
             std::slice::from_ref(&SOCK)
         }
-        fn outputs(&self) -> &[Socket] { &[] }
+        fn outputs(&self) -> &[Socket] {
+            &[]
+        }
         fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
             let msgs = bus.recv_all::<String>()?;
             for (_sock, msg) in msgs {
@@ -2427,12 +2494,16 @@ mod tests {
     }
 
     impl Strand for TestSinkOther {
-        fn name(&self) -> &str { "test-sink-other" }
+        fn name(&self) -> &str {
+            "test-sink-other"
+        }
         fn inputs(&self) -> &[Socket] {
             const SOCK: Socket = Socket::new::<i64>("in.other");
             std::slice::from_ref(&SOCK)
         }
-        fn outputs(&self) -> &[Socket] { &[] }
+        fn outputs(&self) -> &[Socket] {
+            &[]
+        }
         fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
             let msgs = bus.recv_all::<i64>()?;
             self.count.fetch_add(msgs.len() as u32, Ordering::SeqCst);
@@ -2456,8 +2527,12 @@ mod tests {
     }
 
     impl Strand for CustomSource {
-        fn name(&self) -> &str { "custom-source" }
-        fn inputs(&self) -> &[Socket] { &[] }
+        fn name(&self) -> &str {
+            "custom-source"
+        }
+        fn inputs(&self) -> &[Socket] {
+            &[]
+        }
         fn outputs(&self) -> &[Socket] {
             const SOCK: Socket = Socket::new::<CustomPayload>("out.custom");
             std::slice::from_ref(&SOCK)
@@ -2478,12 +2553,16 @@ mod tests {
     }
 
     impl Strand for CustomSink {
-        fn name(&self) -> &str { &self.name }
+        fn name(&self) -> &str {
+            &self.name
+        }
         fn inputs(&self) -> &[Socket] {
             const SOCK: Socket = Socket::new::<CustomPayload>("in.custom");
             std::slice::from_ref(&SOCK)
         }
-        fn outputs(&self) -> &[Socket] { &[] }
+        fn outputs(&self) -> &[Socket] {
+            &[]
+        }
         fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
             let msgs = bus.recv_all::<CustomPayload>()?;
             for (_sock, msg) in msgs {
@@ -2503,12 +2582,16 @@ mod tests {
     }
 
     impl Strand for LifecycleObserver {
-        fn name(&self) -> &str { "lifecycle-observer" }
+        fn name(&self) -> &str {
+            "lifecycle-observer"
+        }
         fn inputs(&self) -> &[Socket] {
             const SOCK: Socket = Socket::new::<LifecycleEvent>(SYS_LIFECYCLE);
             std::slice::from_ref(&SOCK)
         }
-        fn outputs(&self) -> &[Socket] { &[] }
+        fn outputs(&self) -> &[Socket] {
+            &[]
+        }
         fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
             let events = bus.recv_all::<LifecycleEvent>()?;
             for (_sock, evt) in events {
@@ -2583,8 +2666,16 @@ mod tests {
         bus.register(sink_b);
         bus.run_until(Some(Duration::from_millis(300)));
 
-        assert_eq!(count_a.load(Ordering::SeqCst), 3, "sink-A should see all 3 messages");
-        assert_eq!(count_b.load(Ordering::SeqCst), 3, "sink-B should see all 3 messages");
+        assert_eq!(
+            count_a.load(Ordering::SeqCst),
+            3,
+            "sink-A should see all 3 messages"
+        );
+        assert_eq!(
+            count_b.load(Ordering::SeqCst),
+            3,
+            "sink-B should see all 3 messages"
+        );
         assert_eq!(*last_a.lock_tolerant(), "third");
         assert_eq!(*last_b.lock_tolerant(), "third");
     }
@@ -2614,7 +2705,10 @@ mod tests {
         // is registered AFTER the source has published, the
         // messages are in the buffer; the sink should receive
         // them via replay.
-        bus.register(TestSource::new(vec!["buffered-1".into(), "buffered-2".into()]));
+        bus.register(TestSource::new(vec![
+            "buffered-1".into(),
+            "buffered-2".into(),
+        ]));
         // The sink is registered via register_spec so it
         // exists in the spec list and gets installed at the
         // same time as the source. (Whether the sink is online
@@ -2626,7 +2720,11 @@ mod tests {
 
         // Both messages must reach the sink.
         let got = count.load(Ordering::SeqCst);
-        assert_eq!(got, 2, "sink should have received exactly 2 messages (got {})", got);
+        assert_eq!(
+            got, 2,
+            "sink should have received exactly 2 messages (got {})",
+            got
+        );
         // And the last message we observed should be one we sent.
         let last_str = last.lock_tolerant().clone();
         assert!(
@@ -2646,12 +2744,16 @@ mod tests {
     }
 
     impl Strand for SinkFacade {
-        fn name(&self) -> &str { "sink-facade" }
+        fn name(&self) -> &str {
+            "sink-facade"
+        }
         fn inputs(&self) -> &[Socket] {
             const SOCK: Socket = Socket::new::<String>("in.test");
             std::slice::from_ref(&SOCK)
         }
-        fn outputs(&self) -> &[Socket] { &[] }
+        fn outputs(&self) -> &[Socket] {
+            &[]
+        }
         fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
             let msgs = bus.recv_all::<String>()?;
             for (_sock, msg) in msgs {
@@ -2670,7 +2772,9 @@ mod tests {
     fn type_routing_does_not_cross_contaminate() {
         let (sink_str, count_str, _) = TestSink::new("str-sink");
         let other_count = Arc::new(AtomicU32::new(0));
-        let sink_other = TestSinkOther { count: other_count.clone() };
+        let sink_other = TestSinkOther {
+            count: other_count.clone(),
+        };
 
         let mut bus = Bus::open();
         bus.register(TestSource::new(vec!["hello".into(), "world".into()]));
@@ -2703,10 +2807,18 @@ mod tests {
 
         let got = registered.load(Ordering::SeqCst);
         // The observer itself + the source should both register.
-        assert!(got >= 2, "expected at least 2 Registered events (observer + source), got {}", got);
+        assert!(
+            got >= 2,
+            "expected at least 2 Registered events (observer + source), got {}",
+            got
+        );
         // The source detaches after publishing.
         let detached_count = detached.load(Ordering::SeqCst);
-        assert!(detached_count >= 1, "expected at least 1 Detached event from the source, got {}", detached_count);
+        assert!(
+            detached_count >= 1,
+            "expected at least 1 Detached event from the source, got {}",
+            detached_count
+        );
     }
 
     /// A source that returns `StrandError::Detach` exits cleanly.
@@ -2732,13 +2844,22 @@ mod tests {
     #[test]
     fn custom_clone_type_fans_out() {
         register_clone_type::<CustomPayload>();
-        let payload = CustomPayload { n: 42, s: "hello".into() };
+        let payload = CustomPayload {
+            n: 42,
+            s: "hello".into(),
+        };
 
         let last_a = Arc::new(Mutex::new(None::<CustomPayload>));
         let last_b = Arc::new(Mutex::new(None::<CustomPayload>));
 
-        let sink_a = CustomSink { name: "custom-sink-A".into(), last: last_a.clone() };
-        let sink_b = CustomSink { name: "custom-sink-B".into(), last: last_b.clone() };
+        let sink_a = CustomSink {
+            name: "custom-sink-A".into(),
+            last: last_a.clone(),
+        };
+        let sink_b = CustomSink {
+            name: "custom-sink-B".into(),
+            last: last_b.clone(),
+        };
         let published = Arc::new(AtomicU32::new(0));
         let source = CustomSource {
             payload: payload.clone(),
@@ -2754,8 +2875,16 @@ mod tests {
         assert_eq!(published.load(Ordering::SeqCst), 1);
         let a = last_a.lock_tolerant().clone();
         let b = last_b.lock_tolerant().clone();
-        assert_eq!(a, Some(payload.clone()), "sink-A should see the exact payload");
-        assert_eq!(b, Some(payload.clone()), "sink-B should see the exact payload");
+        assert_eq!(
+            a,
+            Some(payload.clone()),
+            "sink-A should see the exact payload"
+        );
+        assert_eq!(
+            b,
+            Some(payload.clone()),
+            "sink-B should see the exact payload"
+        );
     }
 
     /// A burst published at startup, while a subscriber is still being
@@ -3156,7 +3285,12 @@ mod tests {
         let source_threads: Vec<&Thread> = snap
             .threads
             .iter()
-            .filter(|t| matches!(t.direction.first().map(String::as_str), Some("s1") | Some("s2")))
+            .filter(|t| {
+                matches!(
+                    t.direction.first().map(String::as_str),
+                    Some("s1") | Some("s2")
+                )
+            })
             .collect();
         assert_eq!(source_threads.len(), 2, "two source threads expected");
         for t in source_threads {
@@ -3276,8 +3410,16 @@ mod tests {
                     && t.direction.last().map(String::as_str) == Some(sink)
             })
         };
-        assert!(reaches("sink-A"), "a branch should reach sink-A: {:?}", snap.threads);
-        assert!(reaches("sink-B"), "a branch should reach sink-B: {:?}", snap.threads);
+        assert!(
+            reaches("sink-A"),
+            "a branch should reach sink-A: {:?}",
+            snap.threads
+        );
+        assert!(
+            reaches("sink-B"),
+            "a branch should reach sink-B: {:?}",
+            snap.threads
+        );
     }
 
     /// HopTo a live thread routes onto it; HopTo an unminted id falls
@@ -3366,7 +3508,12 @@ mod tests {
         // Known target: the single source mints thread 0 first, M hops
         // onto it (valid arm) — the thread reaches the sink, no ghost.
         let known = run_with(0);
-        assert_eq!(known.threads.len(), 1, "only thread 0, no ghosts: {:?}", known.threads);
+        assert_eq!(
+            known.threads.len(),
+            1,
+            "only thread 0, no ghosts: {:?}",
+            known.threads
+        );
         assert!(
             known.threads[0].direction.iter().any(|n| n == "sink"),
             "hopped thread should reach the sink: {:?}",
@@ -3381,7 +3528,10 @@ mod tests {
             "HopTo to an unminted id must not fabricate a ghost thread"
         );
         assert!(
-            unknown.threads.iter().any(|t| t.direction.iter().any(|n| n == "sink")),
+            unknown
+                .threads
+                .iter()
+                .any(|t| t.direction.iter().any(|n| n == "sink")),
             "fallback should still carry work to the sink: {:?}",
             unknown.threads
         );
@@ -3438,14 +3588,28 @@ mod tests {
         }
         let mut bus = Bus::open();
         bus.register(Join);
-        bus.register(Src { name: "s1", sent: false });
-        bus.register(Src { name: "s2", sent: false });
-        bus.register(Src { name: "s3", sent: false });
+        bus.register(Src {
+            name: "s1",
+            sent: false,
+        });
+        bus.register(Src {
+            name: "s2",
+            sent: false,
+        });
+        bus.register(Src {
+            name: "s3",
+            sent: false,
+        });
         bus.run_until(Some(Duration::from_millis(400)));
 
         let snap = bus.fabric_snapshot();
         let isx = snap.intersection("joiner").expect("intersection at joiner");
-        assert_eq!(isx.threads.len(), 3, "all three threads should bind: {:?}", isx.threads);
+        assert_eq!(
+            isx.threads.len(),
+            3,
+            "all three threads should bind: {:?}",
+            isx.threads
+        );
     }
 
     /// Consuming a reserved sys.* message must NOT sever a strand's work
@@ -3660,7 +3824,11 @@ mod tests {
         bus.place("bad", Position::new(f64::NAN, 0.0, 0.0));
         let snap = bus.fabric_snapshot();
         assert_eq!(snap.position("ok"), Some(Position::new(1.0, 2.0, 3.0)));
-        assert_eq!(snap.position("bad"), None, "a non-finite placement is ignored");
+        assert_eq!(
+            snap.position("bad"),
+            None,
+            "a non-finite placement is ignored"
+        );
     }
 
     /// The fabric records a placed position; `place` overrides an earlier
@@ -3692,7 +3860,11 @@ mod tests {
     // ----- Fabric adjacency (heat-kernel topology) -----------------------
 
     fn edge(from: &str, to: &str, conductance: f64) -> FabricEdge {
-        FabricEdge { from: from.into(), to: to.into(), conductance }
+        FabricEdge {
+            from: from.into(),
+            to: to.into(),
+            conductance,
+        }
     }
 
     fn et(from: &str, to: &str, n: u64) -> (NodeId, NodeId, u64) {
@@ -3706,9 +3878,16 @@ mod tests {
         let threads = isolated
             .iter()
             .enumerate()
-            .map(|(i, n)| Thread { id: i as ThreadId, direction: vec![(*n).into()] })
+            .map(|(i, n)| Thread {
+                id: i as ThreadId,
+                direction: vec![(*n).into()],
+            })
             .collect();
-        FabricSnapshot { threads, edge_traffic: traffic, ..Default::default() }
+        FabricSnapshot {
+            threads,
+            edge_traffic: traffic,
+            ..Default::default()
+        }
     }
 
     /// Edges and their conductances come from the per-edge delivery counts;
@@ -3745,7 +3924,10 @@ mod tests {
     fn adjacency_includes_isolated_node() {
         let snap = snap_with(&["lonely"], vec![et("A", "B", 1)]);
         let adj = snap.adjacency();
-        assert_eq!(adj.nodes, vec!["A".to_string(), "B".into(), "lonely".into()]);
+        assert_eq!(
+            adj.nodes,
+            vec!["A".to_string(), "B".into(), "lonely".into()]
+        );
         assert_eq!(adj.edges, vec![edge("A", "B", 1.0)]);
     }
 
@@ -3763,7 +3945,10 @@ mod tests {
     fn adjacency_is_sorted_and_deterministic() {
         let snap = snap_with(&[], vec![et("Z", "Y", 1), et("M", "A", 1)]);
         let adj = snap.adjacency();
-        assert_eq!(adj.nodes, vec!["A".to_string(), "M".into(), "Y".into(), "Z".into()]);
+        assert_eq!(
+            adj.nodes,
+            vec!["A".to_string(), "M".into(), "Y".into(), "Z".into()]
+        );
         assert_eq!(adj.edges, vec![edge("M", "A", 1.0), edge("Z", "Y", 1.0)]);
     }
 
@@ -4032,17 +4217,33 @@ mod tests {
     fn live_strand_name_collision_panics() {
         struct Dup1;
         impl Strand for Dup1 {
-            fn name(&self) -> &str { "dup-name" }
-            fn inputs(&self) -> &[Socket] { &[] }
-            fn outputs(&self) -> &[Socket] { &[] }
-            fn run(&mut self, _bus: &mut BusHandle) -> Result<(), StrandError> { Ok(()) }
+            fn name(&self) -> &str {
+                "dup-name"
+            }
+            fn inputs(&self) -> &[Socket] {
+                &[]
+            }
+            fn outputs(&self) -> &[Socket] {
+                &[]
+            }
+            fn run(&mut self, _bus: &mut BusHandle) -> Result<(), StrandError> {
+                Ok(())
+            }
         }
         struct Dup2;
         impl Strand for Dup2 {
-            fn name(&self) -> &str { "dup-name" }
-            fn inputs(&self) -> &[Socket] { &[] }
-            fn outputs(&self) -> &[Socket] { &[] }
-            fn run(&mut self, _bus: &mut BusHandle) -> Result<(), StrandError> { Ok(()) }
+            fn name(&self) -> &str {
+                "dup-name"
+            }
+            fn inputs(&self) -> &[Socket] {
+                &[]
+            }
+            fn outputs(&self) -> &[Socket] {
+                &[]
+            }
+            fn run(&mut self, _bus: &mut BusHandle) -> Result<(), StrandError> {
+                Ok(())
+            }
         }
         let mut bus = Bus::open();
         bus.register(Dup1);
@@ -4055,8 +4256,12 @@ mod tests {
     #[should_panic(expected = "strand name collision")]
     fn spec_strand_name_collision_panics() {
         let mut bus = Bus::open();
-        bus.register_spec(StrandSpec::new("dup-spec", || Box::new(TestSource::new(vec!["a".into()]))));
-        bus.register_spec(StrandSpec::new("dup-spec", || Box::new(TestSource::new(vec!["b".into()]))));
+        bus.register_spec(StrandSpec::new("dup-spec", || {
+            Box::new(TestSource::new(vec!["a".into()]))
+        }));
+        bus.register_spec(StrandSpec::new("dup-spec", || {
+            Box::new(TestSource::new(vec!["b".into()]))
+        }));
     }
 
     // ----- Explicit spider registration (H3) -----------------------------
@@ -4067,7 +4272,11 @@ mod tests {
     #[should_panic(expected = "register_spider called twice")]
     fn double_spider_registration_panics() {
         let mut bus = Bus::open();
-        bus.register_spider(StrandSpec::new("spider-1", || Box::new(TestSource::new(vec!["x".into()]))));
-        bus.register_spider(StrandSpec::new("spider-2", || Box::new(TestSource::new(vec!["y".into()]))));
+        bus.register_spider(StrandSpec::new("spider-1", || {
+            Box::new(TestSource::new(vec!["x".into()]))
+        }));
+        bus.register_spider(StrandSpec::new("spider-2", || {
+            Box::new(TestSource::new(vec!["y".into()]))
+        }));
     }
 }

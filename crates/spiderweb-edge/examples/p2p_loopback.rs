@@ -67,7 +67,9 @@ impl Strand for Depot {
     fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
         for (_s, order) in bus.recv_all::<String>()? {
             self.seen.fetch_add(1, Ordering::SeqCst);
-            bus.log(&format!("📥 bus B received {order}  (crossed a real socket)"));
+            bus.log(&format!(
+                "📥 bus B received {order}  (crossed a real socket)"
+            ));
         }
         bus.sleep(Duration::from_millis(10));
         Ok(())

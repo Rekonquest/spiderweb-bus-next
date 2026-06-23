@@ -76,14 +76,16 @@ impl Strand for AutoPlaced {
 
 // Each crate advertises itself — here at the test module's scope. No
 // main() edit; `auto_connect` finds them.
-advertise!("auto-src", || Box::new(AutoSrc { sent: false }) as Box<dyn Strand>);
+advertise!("auto-src", || Box::new(AutoSrc { sent: false })
+    as Box<dyn Strand>);
 advertise!("auto-snk", || Box::new(AutoSnk) as Box<dyn Strand>);
 advertise_at!(
     "auto-placed",
     || Box::new(AutoPlaced) as Box<dyn Strand>,
     Position::new(7.0, 8.0, 9.0)
 );
-advertise_spider!("auto-spider", || Box::new(spider::Spider::new()) as Box<dyn Strand>);
+advertise_spider!("auto-spider", || Box::new(spider::Spider::new())
+    as Box<dyn Strand>);
 
 #[test]
 fn advertised_set_is_collected() {
@@ -142,7 +144,10 @@ fn factory_yields_independent_instances() {
     let s2 = (adv.factory)();
     let p1 = (&*s1 as *const dyn Strand) as *const ();
     let p2 = (&*s2 as *const dyn Strand) as *const ();
-    assert_ne!(p1, p2, "each factory call must build a fresh strand, not a shared one");
+    assert_ne!(
+        p1, p2,
+        "each factory call must build a fresh strand, not a shared one"
+    );
 }
 
 /// Two advertised spiders must panic — the at-most-one rule holds through

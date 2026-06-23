@@ -25,7 +25,8 @@ use cap_source as _;
 
 // Advertise the orchestrator from here, so the `spider` crate itself
 // stays dependency-light.
-advertise_spider!("spider", || Box::new(spider::Spider::new()) as Box<dyn Strand>);
+advertise_spider!("spider", || Box::new(spider::Spider::new())
+    as Box<dyn Strand>);
 
 fn main() {
     let mut bus = Bus::open();

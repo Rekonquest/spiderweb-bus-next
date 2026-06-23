@@ -20,9 +20,7 @@ impl CapSink {
     }
 
     pub fn with_tag(tag: impl Into<String>) -> Self {
-        CapSink {
-            tag: tag.into(),
-        }
+        CapSink { tag: tag.into() }
     }
 }
 

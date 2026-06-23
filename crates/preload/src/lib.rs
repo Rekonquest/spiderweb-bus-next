@@ -137,7 +137,10 @@ impl<T: Send + 'static> Preloader<T> {
     }
 
     fn build(depth: usize, fetchers: Vec<Box<dyn FnMut(u64) -> Option<T> + Send>>) -> Self {
-        assert!(depth >= 1, "a preloader needs a buffer depth of at least one");
+        assert!(
+            depth >= 1,
+            "a preloader needs a buffer depth of at least one"
+        );
 
         let (ready_tx, ready_rx) = mpsc::sync_channel::<T>(depth);
         let stop = Arc::new(AtomicBool::new(false));
@@ -375,7 +378,10 @@ impl<T: Send + Clone + 'static> PreloadStrand<T> {
         burst: usize,
         preloader: Preloader<T>,
     ) -> Self {
-        assert!(burst >= 1, "a preload strand must publish at least one item per tick");
+        assert!(
+            burst >= 1,
+            "a preload strand must publish at least one item per tick"
+        );
         PreloadStrand {
             name: name.into(),
             out_sockets: [
@@ -665,7 +671,10 @@ mod tests {
         while pre.ready_len() < 2 && start.elapsed() < Duration::from_secs(2) {
             thread::sleep(Duration::from_millis(1));
         }
-        assert!(!pre.is_starved(2), "two banked items meet the low-water of 2");
+        assert!(
+            !pre.is_starved(2),
+            "two banked items meet the low-water of 2"
+        );
         // Drain it; now it's below the threshold.
         while pre.take().is_some() {}
         assert!(pre.is_starved(2), "an empty buffer is starved");
@@ -675,14 +684,13 @@ mod tests {
     /// its configured read-ahead depth.
     #[test]
     fn with_burst_constructs() {
-        let strand =
-            PreloadStrand::<u64>::with_burst("loader", "out", 6, 2, |i| {
-                if i < 3 {
-                    Some(i)
-                } else {
-                    None
-                }
-            });
+        let strand = PreloadStrand::<u64>::with_burst("loader", "out", 6, 2, |i| {
+            if i < 3 {
+                Some(i)
+            } else {
+                None
+            }
+        });
         assert_eq!(strand.name(), "loader");
         // The read-ahead engine is depth 6 regardless of the burst.
         assert_eq!(strand.preloader.depth(), 6);

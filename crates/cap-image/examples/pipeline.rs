@@ -12,10 +12,10 @@
 //! 5. Watch the bus route the bytes from one publisher to one
 //!    processor to two consumers.
 
-use spiderweb::Bus;
 use cap_image::{CapImage, CapImageSink, CapImageSource, ImageRequest, ImageResult};
-use spider::Spider;
 use image::{ImageBuffer, Rgb, RgbImage};
+use spider::Spider;
+use spiderweb::Bus;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -79,7 +79,11 @@ fn main() {
         for entry in entries.flatten() {
             let path = entry.path();
             let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            println!("  {} ({} bytes)", path.file_name().unwrap().to_string_lossy(), size);
+            println!(
+                "  {} ({} bytes)",
+                path.file_name().unwrap().to_string_lossy(),
+                size
+            );
         }
     }
 }

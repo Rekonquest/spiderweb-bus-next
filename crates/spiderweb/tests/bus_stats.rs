@@ -96,8 +96,16 @@ fn stats_count_deliveries_registrations_and_per_strand_throughput() {
         sink.processed
     );
     // The work edge source->sink exists in the fabric.
-    assert!(stats.nodes >= 2, "expected >= 2 fabric nodes, got {}", stats.nodes);
-    assert!(stats.edges >= 1, "expected >= 1 fabric edge, got {}", stats.edges);
+    assert!(
+        stats.nodes >= 2,
+        "expected >= 2 fabric nodes, got {}",
+        stats.nodes
+    );
+    assert!(
+        stats.edges >= 1,
+        "expected >= 1 fabric edge, got {}",
+        stats.edges
+    );
     assert!(
         stats.edge_traffic_total >= 5,
         "edge traffic should total >= 5, got {}",

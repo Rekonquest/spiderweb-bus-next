@@ -153,15 +153,13 @@ fn run_demo(name: &str) {
             std::process::exit(1);
         }
     };
-    println!("🕸️  running `{}` ({} seconds)\n", demo.name, demo.estimated_duration.as_secs());
+    println!(
+        "🕸️  running `{}` ({} seconds)\n",
+        demo.name,
+        demo.estimated_duration.as_secs()
+    );
     let status = Command::new("cargo")
-        .args([
-            "run",
-            "-p",
-            demo.package,
-            "--example",
-            demo.example,
-        ])
+        .args(["run", "-p", demo.package, "--example", demo.example])
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status();
