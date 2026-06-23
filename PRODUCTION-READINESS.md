@@ -129,8 +129,9 @@ misbehaving, and must shut down cleanly.
   `NodeId`-keyed → bounded by distinct strand names, which a restart reuses
   (churn-invariant); `edge_traffic` is node-pair-keyed (O(nodes²), cumulative
   u64); `pending` → per-type `PENDING_BUFFER_CAP`; `slots` → name-keyed, restart
-  replaces. (Also widened the wind-down failsafe timeouts 5s→10s so the suite
-  doesn't flake under parallel load.)
+  replaces. (Also widened the **test harness** `recv_timeout`s 5s→10s in
+  `spider_recovery.rs` so the suite doesn't flake under parallel load — the
+  kernel's own `WORKER_JOIN_DEADLINE` stays 5s, per the Phase-1 note above.)
 
 ## Phase 3 — Edge transport to production (the distributed story)
 - [x] **Clean teardown.** `EdgeListener::Drop` stops its reader thread and
@@ -152,15 +153,22 @@ misbehaving, and must shut down cleanly.
   (sliding-window RLNC) OR end-to-end ACK windows; frees the ring by receiver
   progress, not age.
 - [x] **Session IDs.** Fixed the sender-restart blackout. Each frame now carries
-  a per-process **session id** (monotonic wall-clock nanos, distinct across
-  restarts); the wire frame is `[u64 session][u64 seq][u32 tag_len][tag][u32
-  payload_len][payload]`. The receiver dedups by `(session, seq)` and resets its
-  high-water to 0 the instant a new session appears — so a restarted sender
-  (seqs reset to 1) is recovered cleanly instead of having its low seqs skipped
-  against the old high-water (the multi-thousand-frame blackout). O(1) state
-  (current session + high-water), bounded. Regression test
-  `restarted_sender_recovers_instead_of_blacking_out` (5 frames across a
-  simulated restart, all delivered, no dups).
+  a per-process **session id** (wall-clock nanos, distinct across restarts); the
+  wire frame is `[u64 session][u64 seq][u32 tag_len][tag][u32 payload_len][payload]`.
+  The receiver keeps a **bounded per-session high-water map** (`SESSION_TRACK`
+  entries, oldest evicted) and delivers a frame only if its `seq` exceeds its
+  OWN session's mark. A restarted sender (new session, seqs reset to 1) starts at
+  mark 0 and is recovered cleanly instead of having its low seqs skipped against
+  the old high-water (the multi-thousand-frame blackout). A session that briefly
+  **reappears** (oscillation A→B→A, or two senders sharing one listener) resumes
+  its prior mark rather than resetting to 0 — so it cannot re-deliver a replayed
+  ring as duplicates (exactly-once across sessions). Bounded state. Regression
+  tests `restarted_sender_recovers_instead_of_blacking_out` (5 frames across a
+  simulated restart, all delivered, no dups) and
+  `oscillating_sessions_do_not_re_deliver_a_replayed_ring` (A→B→A replay adds
+  nothing). Caveat: the single reader thread reads one connection to EOF/timeout
+  before accepting the next, so a **half-open** prior connection can delay a
+  restarted sender's recovery up to `READ_TIMEOUT_SECS` (30s) — latency, not loss.
 - [ ] **Cross-machine causality.** Interval Tree Clock stamp on the wire.
 
 ## Phase 4 — Quality gates (proof, not vibes)

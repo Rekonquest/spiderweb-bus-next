@@ -18,7 +18,8 @@ layer is an honest trusted-network MVP. See
 - **Vibrations** (`Backpressure`, `Starved`) on `SYS_VIBRATION`.
 - **Highway** parallel layer (on-ramp/off-ramp lane pool, backpressure).
 - **Preload** read-ahead source (starvation signal).
-- **Self-registration** (`advertise!`) + `Bus::auto_connect()`.
+- **Self-registration** (`advertise!`) + `bus.auto_connect()` (via the
+  `BusAutoConnect` extension trait).
 - 3D spatial overlay + `spiderweb-viz` (JSON / interactive HTML scene).
 - **`spiderweb-edge`**: cross-process/P2P transport over TCP (std-only) with
   bounded reliable delivery (session + seq + resend ring + dedup), including

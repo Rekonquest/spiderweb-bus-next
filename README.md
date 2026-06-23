@@ -86,7 +86,7 @@ kernel and the architecture notes throughout.
 | **`spider`** | The orchestrator strand — restart/quarantine policy over `sys.lifecycle` / `sys.control`. |
 | **`highway`** | Layer-2 on-ramp/off-ramp around a parallel lane pool; emits backpressure vibrations. |
 | **`preload`** | Background read-ahead source; emits starvation vibrations. |
-| **`spiderweb-registry`** | Self-registration (`advertise!`) + `Bus::auto_connect()` (quarantines the one `inventory` dep). |
+| **`spiderweb-registry`** | Self-registration (`advertise!`) + `bus.auto_connect()` (via the `BusAutoConnect` extension trait; quarantines the one `inventory` dep). |
 | **`spiderweb-edge`** | Cross-process / P2P transport over TCP (std-only). Reliable framing; **trusted-network MVP**. |
 | **`spiderweb-heat`** | Graph heat-kernel attenuation (`H_t = exp(−tL)`) — topology-aware vibration decay. |
 | **`spiderweb-viz`** | Export the fabric as a 3D scene (JSON / interactive HTML); `render_top` dashboard. |
