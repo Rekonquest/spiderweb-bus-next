@@ -85,7 +85,16 @@ misbehaving, and must shut down cleanly.
   All `Relaxed` (observational, no decisions); `stats()` takes fabric then slots
   locks non-nested (no deadlock — reviewed). 7 tests (`bus_stats.rs`). Edge
   bytes/frames deferred to the Phase-3 edge-stats source.
-- [ ] **`webctl top`.** Live topology + per-node health from a running bus.
+- [x] **`webctl top`.** Live per-node health + topology of a running bus.
+  `spiderweb_viz::render_top(&BusStats)` formats a compact terminal dashboard
+  (web-wide counters, lifecycle tally, per-strand throughput table); the
+  `spiderweb-viz` `top` example runs a representative web + a `TopReporter`
+  strand that pulls `BusHandle::stats()` and re-renders each interval (live,
+  introspected from inside the bus); `webctl top` launches it (`topology` stays
+  the static reference). Verified end-to-end (a real frame renders with coherent
+  counts — crash 4 / restart 3 / quarantine 1 matching spider policy). 2 render
+  tests. (Running it caught + fixed a misleading `pending_evictions` doc: it is
+  replay-buffer churn, not necessarily lost work.)
 - [x] **Bounded-everything audit.** Audited every kernel map/queue. **Found +
   fixed a real leak:** the subscriber map was never pruned, so each crash/
   restart left a dead subscriber (per input socket) — unbounded growth *and*

@@ -161,9 +161,13 @@ pub struct BusStats {
     /// N. Excludes the kernel's own internal lifecycle fan-out, which is
     /// counted precisely by kind in the fields below.
     pub delivered: u64,
-    /// Messages dropped from a per-type pending buffer that was at
-    /// `PENDING_BUFFER_CAP` with no subscriber yet — the honest "lost because
-    /// nobody was listening and the buffer was full" signal.
+    /// Messages aged out of a per-type **replay buffer** at
+    /// `PENDING_BUFFER_CAP`. The kernel buffers a bounded tail of every type so
+    /// a *late* subscriber can be caught up; once more than the cap have flowed,
+    /// the oldest age out. This is normal replay-buffer churn, NOT necessarily
+    /// lost work — any already-subscribed strand received the message by direct
+    /// delivery. It means a lost delivery only for a subscriber that arrives
+    /// *after* its message has already aged out.
     pub pending_evictions: u64,
     /// Total [`Vibration`] messages delivered on [`SYS_VIBRATION`].
     pub vibrations: u64,

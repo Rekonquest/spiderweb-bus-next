@@ -6,7 +6,8 @@
 //! Subcommands:
 //! - `webctl list`         — list available demos
 //! - `webctl run <name>`   — run a demo by name
-//! - `webctl topology`     — show the static topology from a demo
+//! - `webctl top`          — live dashboard of a running bus (BusStats)
+//! - `webctl topology`     — show the static topology reference
 //! - `webctl version`      — show the kernel version
 
 use std::process::{Command, Stdio};
@@ -113,7 +114,8 @@ fn main() {
             };
             run_demo(name);
         }
-        "topology" | "top" => show_topology(),
+        "top" => run_top(),
+        "topology" => show_topology(),
         "version" | "--version" | "-v" => {
             println!("webctl {}", VERSION);
             println!("spiderweb v1.3");
@@ -170,6 +172,23 @@ fn run_demo(name: &str) {
     }
 }
 
+fn run_top() {
+    // Live dashboard of a running bus: launches the `top` example (a small web
+    // + a reporter strand that re-renders BusStats each interval). Introspects
+    // a bus from the inside — the in-process analogue of `top` for the web.
+    println!("🕸️  launching live `top` …\n");
+    let status = Command::new("cargo")
+        .args(["run", "-p", "spiderweb-viz", "--example", "top"])
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => println!("\n✗ `top` exited with code {:?}", s.code()),
+        Err(e) => eprintln!("\n✗ failed to launch `top`: {}", e),
+    }
+}
+
 fn show_topology() {
     println!("🕸️  spiderweb bus topology (v1.3):\n");
     println!("Strand types:");
@@ -196,7 +215,8 @@ fn print_help() {
     println!("COMMANDS:");
     println!("    list           List available demos");
     println!("    run <name>     Run a demo");
-    println!("    topology       Show the static topology");
+    println!("    top            Live dashboard of a running bus (BusStats)");
+    println!("    topology       Show the static topology reference");
     println!("    version        Show the version");
     println!("    help           Show this help");
 }
