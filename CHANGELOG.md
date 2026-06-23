@@ -21,7 +21,9 @@ layer is an honest trusted-network MVP. See
 - **Self-registration** (`advertise!`) + `Bus::auto_connect()`.
 - 3D spatial overlay + `spiderweb-viz` (JSON / interactive HTML scene).
 - **`spiderweb-edge`**: cross-process/P2P transport over TCP (std-only) with
-  bounded reliable delivery (seq + resend ring + dedup).
+  bounded reliable delivery (session + seq + resend ring + dedup), including
+  **session-ID restart recovery** (a restarted sender is recovered, not blacked
+  out) and clean `EdgeListener::Drop` teardown.
 - **`spiderweb-heat`**: graph heat-kernel attenuation (`H_t = exp(−tL)`).
 
 ### Hardened — production readiness (Phases 1–2)
@@ -45,7 +47,8 @@ layer is an honest trusted-network MVP. See
 - **CI**: `fmt --check` + `clippy -D warnings` + `test` on every push/PR.
 
 ### Known gaps (roadmap)
-- Edge transport is **plaintext, trusted-network only** — no per-frame MAC, no
-  TLS (where the zero-dep story ends and crypto deps begin).
-- Edge reliability assumes one long-lived sender; a sender restart needs
-  session IDs. No cross-machine causality (ITC) yet.
+- Edge transport is **plaintext, trusted-network only** — no per-frame MAC
+  (auth), no TLS (where the zero-dep story ends and crypto deps begin).
+- Edge reliability is a bounded resend ring (sender restarts handled via session
+  IDs); unbounded/no-head-of-line-blocking reliability (RLNC tier-2) and
+  cross-machine causality (ITC) are the remaining tiers.

@@ -98,13 +98,16 @@ kernel and the architecture notes throughout.
 **Solid (tested, reviewed):** panic isolation, graceful shutdown + bounded
 worker join, kernel poison-tolerance, no-panic untrusted-input parsing, pull-able
 `BusStats`, bounded-everything (incl. a fixed subscriber-leak), `EdgeListener`
-clean teardown, fuzzed wire parser, exactly-once + mass-conservation property
+clean teardown, **session-ID restart recovery** (a restarted sender is recovered,
+not blacked out), fuzzed wire parser, exactly-once + mass-conservation property
 tests, CI (fmt + clippy `-D warnings` + test).
 
 **Honest gaps (roadmap):** the edge layer is **plaintext, trusted-network only** —
-no per-frame MAC, no TLS yet (this is where the zero-dep story ends and crypto
-deps begin). Edge reliability is a bounded resend ring (single long-lived sender;
-a sender *restart* needs session IDs). No cross-machine causality (ITC) yet.
+no per-frame MAC (auth), no TLS yet (this is where the zero-dep story ends and
+crypto deps begin). Edge reliability is a bounded resend ring (recovers up to
+`RING_CAP` frames of disconnect, with session IDs handling sender restarts);
+unbounded/no-head-of-line-blocking reliability (RLNC tier-2) and cross-machine
+causality (ITC) are the remaining tiers.
 
 ## Build & test
 
