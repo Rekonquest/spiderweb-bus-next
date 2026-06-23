@@ -16,6 +16,26 @@
 
 Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (tests + review)
 
+## Deliverable verdict (2026-06-23)
+
+**The in-process bus is deliverable.** Phases 1 (Robustness), 2 (Observability),
+4 (Quality gates), and 5 (Packaging) are complete; the workspace is green
+(`cargo test --workspace`, `clippy -D warnings`, `fmt --check`), the demos run
+(highway ~5.5×, weave, heat, `webctl top`), it is documented (README +
+quickstart + rustdoc), dual-licensed, CHANGELOG'd, and CI-gated. Ship it as an
+embeddable git dependency today (crates.io needs only a one-line rename — the
+name `spiderweb` is taken).
+
+**The edge transport is a hardened trusted-network MVP.** Both non-crypto
+Phase-3 reliability items are done (`EdgeListener::Drop` teardown + session-ID
+restart recovery). The remaining Phase-3 items are deferred by scope, not
+overlooked: **auth (MAC) + encryption (TLS)** are where the zero-dep story ends
+and a crypto-dependency decision is owed; **RLNC tier-2 + ITC causality** are
+heavier distributed features. All four are documented with an honest threat
+model (`spiderweb-edge` is plaintext, trusted-network only). Deploy the edge on
+a trusted network now; harden for a hostile network when the crypto direction is
+chosen.
+
 ---
 
 ## Phase 1 — Robustness (the bus must not fall over)
