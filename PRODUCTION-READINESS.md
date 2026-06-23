@@ -86,9 +86,22 @@ misbehaving, and must shut down cleanly.
   locks non-nested (no deadlock — reviewed). 7 tests (`bus_stats.rs`). Edge
   bytes/frames deferred to the Phase-3 edge-stats source.
 - [ ] **`webctl top`.** Live topology + per-node health from a running bus.
-- [ ] **Bounded-everything audit.** Confirm every map/queue is bounded.
-  `THREAD_CAP`/`PENDING_BUFFER_CAP` exist; verify `positions`, `transfers`,
-  `node_threads`, `edge_traffic` cannot grow without bound under churn.
+- [x] **Bounded-everything audit.** Audited every kernel map/queue. **Found +
+  fixed a real leak:** the subscriber map was never pruned, so each crash/
+  restart left a dead subscriber (per input socket) — unbounded growth *and*
+  growing per-delivery cost under churn. Fixed with lazy pruning: a subscriber
+  whose send fails (receiver gone) is removed by `Arc` identity on the next
+  delivery (loses nothing — a disconnected receiver can't receive; steady-state
+  hot path pays zero). Made observable as `BusStats.subscribers`; regression
+  test `subscriber_map_stays_bounded_under_restart_churn` drives heavy churn and
+  asserts the count stays flat while `restarted` climbs. Verified the rest:
+  `threads` → `THREAD_CAP` (eviction scrubs `node_threads`/`intersections`/
+  `merged`); `positions`/`transfers`/`node_threads`/`intersections`/`merged` are
+  `NodeId`-keyed → bounded by distinct strand names, which a restart reuses
+  (churn-invariant); `edge_traffic` is node-pair-keyed (O(nodes²), cumulative
+  u64); `pending` → per-type `PENDING_BUFFER_CAP`; `slots` → name-keyed, restart
+  replaces. (Also widened the wind-down failsafe timeouts 5s→10s so the suite
+  doesn't flake under parallel load.)
 
 ## Phase 3 — Edge transport to production (the distributed story)
 - [ ] **Clean teardown.** `EdgeListener::Drop` stops its reader thread (needs
