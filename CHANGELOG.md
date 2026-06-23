@@ -1,0 +1,51 @@
+# Changelog
+
+All notable changes to the Spiderweb Bus. Format loosely follows
+[Keep a Changelog](https://keepachangelog.com/); the project follows semver
+once it reaches `1.0.0`.
+
+## [Unreleased] — 0.1.0 path
+
+The in-process core is robust, observable, and tested. The distributed edge
+layer is an honest trusted-network MVP. See
+[PRODUCTION-READINESS.md](PRODUCTION-READINESS.md) for the full tracking board.
+
+### Added — architecture
+- Typed pub/sub kernel with fan-out by `TypeId`; std-only, zero-dep,
+  `#![forbid(unsafe_code)]`.
+- Emergent **fabric**: threads (desire-paths), intersections, transfer policies
+  (`Stay`/`HopTo`/`MergeAll`); `Bus::fabric_snapshot()` + weighted `adjacency()`.
+- **Vibrations** (`Backpressure`, `Starved`) on `SYS_VIBRATION`.
+- **Highway** parallel layer (on-ramp/off-ramp lane pool, backpressure).
+- **Preload** read-ahead source (starvation signal).
+- **Self-registration** (`advertise!`) + `Bus::auto_connect()`.
+- 3D spatial overlay + `spiderweb-viz` (JSON / interactive HTML scene).
+- **`spiderweb-edge`**: cross-process/P2P transport over TCP (std-only) with
+  bounded reliable delivery (seq + resend ring + dedup).
+- **`spiderweb-heat`**: graph heat-kernel attenuation (`H_t = exp(−tL)`).
+
+### Hardened — production readiness (Phases 1–2)
+- **Panic isolation**: a panicking strand becomes a `Crashed` lifecycle event
+  (spider policy applies), never a silent worker death; panic message recovered.
+- **Graceful shutdown**: cooperative flag + bounded best-effort worker join, so
+  strands are dropped (`Drop` runs); `BusHandle::is_shutting_down()`.
+- **Kernel poison-tolerance**: all locks recover from poison; one panic can't
+  cascade-kill the bus.
+- **No-panic untrusted input**: `read_frame` bounds-checks before allocating;
+  `read_frame`/`write_frame` made `impl Read`/`Write`-generic for testing.
+- **Pull-able telemetry** `BusStats` (kernel-wide + lifecycle + per-strand).
+- **Bounded-everything** audit; fixed an unbounded subscriber-map leak under
+  crash/restart churn (lazy pruning).
+- **`webctl top`** live dashboard; `EdgeListener::Drop` clean teardown.
+
+### Tested — quality gates (Phase 4)
+- Randomized **fuzz** of the wire parser (200k adversarial inputs, std-only).
+- **Property tests**: exactly-once fan-out (random shapes); heat-kernel mass
+  conservation (3000 random graphs).
+- **CI**: `fmt --check` + `clippy -D warnings` + `test` on every push/PR.
+
+### Known gaps (roadmap)
+- Edge transport is **plaintext, trusted-network only** — no per-frame MAC, no
+  TLS (where the zero-dep story ends and crypto deps begin).
+- Edge reliability assumes one long-lived sender; a sender restart needs
+  session IDs. No cross-machine causality (ITC) yet.
