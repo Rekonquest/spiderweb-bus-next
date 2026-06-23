@@ -371,42 +371,50 @@ fn reader_loop(listener: TcpListener, tx: mpsc::SyncSender<(u64, String, Vec<u8>
     }
 }
 
-fn write_frame(stream: &mut TcpStream, seq: u64, tag: &str, payload: &[u8]) -> std::io::Result<()> {
-    stream.write_all(&seq.to_be_bytes())?;
+/// Write one wire frame to any byte sink. Generic over [`Write`] (not tied to
+/// [`TcpStream`]) so frames can be built into an in-memory buffer for tests and
+/// round-trip checks against [`read_frame`].
+fn write_frame<W: Write>(w: &mut W, seq: u64, tag: &str, payload: &[u8]) -> std::io::Result<()> {
+    w.write_all(&seq.to_be_bytes())?;
     let tag_b = tag.as_bytes();
-    stream.write_all(&(tag_b.len() as u32).to_be_bytes())?;
-    stream.write_all(tag_b)?;
-    stream.write_all(&(payload.len() as u32).to_be_bytes())?;
-    stream.write_all(payload)?;
-    stream.flush()
+    w.write_all(&(tag_b.len() as u32).to_be_bytes())?;
+    w.write_all(tag_b)?;
+    w.write_all(&(payload.len() as u32).to_be_bytes())?;
+    w.write_all(payload)?;
+    w.flush()
 }
 
-fn read_frame(stream: &mut TcpStream) -> std::io::Result<(u64, String, Vec<u8>)> {
+/// Parse one wire frame from any byte source. Generic over [`Read`] (not tied
+/// to [`TcpStream`]) so the untrusted-input parser can be unit-tested and
+/// fuzzed in isolation against in-memory byte slices. Every length is bounds-
+/// checked against its cap BEFORE allocating, so a hostile peer cannot induce
+/// a huge allocation or a panic — malformed input always returns `Err`.
+fn read_frame<R: Read>(r: &mut R) -> std::io::Result<(u64, String, Vec<u8>)> {
     use std::io::{Error, ErrorKind};
     let mut seq8 = [0u8; 8];
-    stream.read_exact(&mut seq8)?;
+    r.read_exact(&mut seq8)?;
     let seq = u64::from_be_bytes(seq8);
     if seq == 0 {
         // 0 is the reserved "none yet" sentinel; a real frame's seq is >= 1.
         return Err(Error::new(ErrorKind::InvalidData, "seq 0 is reserved"));
     }
     let mut len4 = [0u8; 4];
-    stream.read_exact(&mut len4)?;
+    r.read_exact(&mut len4)?;
     let tag_len = u32::from_be_bytes(len4) as usize;
     if tag_len > MAX_TAG {
         return Err(Error::new(ErrorKind::InvalidData, "tag too long"));
     }
     let mut tag_b = vec![0u8; tag_len];
-    stream.read_exact(&mut tag_b)?;
+    r.read_exact(&mut tag_b)?;
     let tag = String::from_utf8(tag_b).map_err(|_| Error::new(ErrorKind::InvalidData, "tag not utf8"))?;
 
-    stream.read_exact(&mut len4)?;
+    r.read_exact(&mut len4)?;
     let payload_len = u32::from_be_bytes(len4) as usize;
     if payload_len > MAX_PAYLOAD {
         return Err(Error::new(ErrorKind::InvalidData, "payload too long"));
     }
     let mut payload = vec![0u8; payload_len];
-    stream.read_exact(&mut payload)?;
+    r.read_exact(&mut payload)?;
     Ok((seq, tag, payload))
 }
 
@@ -415,6 +423,115 @@ mod tests {
     use super::*;
     use spiderweb::{register_clone_type, Bus};
     use std::sync::{Arc, Mutex};
+
+    // ----- Wire-parser robustness (untrusted input) -------------------------
+    //
+    // `read_frame` parses bytes straight off the network. A hostile or buggy
+    // peer must NEVER be able to make it panic or induce a huge allocation —
+    // malformed input must always come back as `Err`. These tests drive the
+    // (now `impl Read`-generic) parser against in-memory byte slices.
+
+    /// A well-formed frame round-trips through write_frame → read_frame.
+    #[test]
+    fn frame_round_trips() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, 42, "wire.note", b"hello").unwrap();
+        let mut cur = std::io::Cursor::new(buf);
+        let (seq, tag, payload) = read_frame(&mut cur).expect("valid frame should parse");
+        assert_eq!(seq, 42);
+        assert_eq!(tag, "wire.note");
+        assert_eq!(payload, b"hello");
+    }
+
+    /// seq 0 is the reserved sentinel and must be rejected, not delivered.
+    #[test]
+    fn frame_rejects_reserved_seq_zero() {
+        let mut buf = Vec::new();
+        // Hand-build a seq-0 frame (write_frame would happily encode it).
+        buf.extend_from_slice(&0u64.to_be_bytes());
+        buf.extend_from_slice(&3u32.to_be_bytes());
+        buf.extend_from_slice(b"abc");
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        let mut cur = std::io::Cursor::new(buf);
+        assert!(read_frame(&mut cur).is_err(), "seq 0 must be rejected");
+    }
+
+    /// A declared tag length past MAX_TAG must be rejected BEFORE allocating —
+    /// the parser must not try to read/allocate a 4 GiB tag.
+    #[test]
+    fn frame_rejects_oversized_tag_without_allocating() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u64.to_be_bytes());
+        // Declare a tag far larger than MAX_TAG; provide no tag bytes.
+        buf.extend_from_slice(&(u32::MAX).to_be_bytes());
+        let mut cur = std::io::Cursor::new(buf);
+        let err = read_frame(&mut cur).expect_err("oversized tag must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// A declared payload length past MAX_PAYLOAD must be rejected before
+    /// allocating, even with a valid tag preceding it.
+    #[test]
+    fn frame_rejects_oversized_payload_without_allocating() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u64.to_be_bytes());
+        buf.extend_from_slice(&3u32.to_be_bytes());
+        buf.extend_from_slice(b"abc");
+        buf.extend_from_slice(&(u32::MAX).to_be_bytes()); // payload_len
+        let mut cur = std::io::Cursor::new(buf);
+        let err = read_frame(&mut cur).expect_err("oversized payload must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// A tag whose bytes are not valid UTF-8 must be rejected, not lossily
+    /// decoded.
+    #[test]
+    fn frame_rejects_non_utf8_tag() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u64.to_be_bytes());
+        buf.extend_from_slice(&2u32.to_be_bytes());
+        buf.extend_from_slice(&[0xff, 0xfe]); // invalid UTF-8
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        let mut cur = std::io::Cursor::new(buf);
+        assert!(read_frame(&mut cur).is_err(), "non-utf8 tag must be rejected");
+    }
+
+    /// A truncated frame (header promises more bytes than exist) must return
+    /// `Err` from `read_exact`, never hang or panic.
+    #[test]
+    fn frame_rejects_truncation() {
+        // Full header declaring a 10-byte payload, but only 2 bytes follow.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u64.to_be_bytes());
+        buf.extend_from_slice(&3u32.to_be_bytes());
+        buf.extend_from_slice(b"abc");
+        buf.extend_from_slice(&10u32.to_be_bytes());
+        buf.extend_from_slice(b"xy"); // only 2 of 10 payload bytes
+        let mut cur = std::io::Cursor::new(buf);
+        assert!(read_frame(&mut cur).is_err(), "truncated frame must error");
+    }
+
+    /// An empty stream (peer connected then sent nothing / closed) yields an
+    /// EOF error, cleanly.
+    #[test]
+    fn frame_handles_empty_stream() {
+        let mut cur = std::io::Cursor::new(Vec::<u8>::new());
+        assert!(read_frame(&mut cur).is_err(), "empty stream must error, not hang");
+    }
+
+    /// Max-size boundary: a tag of exactly MAX_TAG and a payload of exactly
+    /// MAX_PAYLOAD are accepted (the bound is inclusive). Uses a small payload
+    /// check at the tag boundary to keep the test fast.
+    #[test]
+    fn frame_accepts_max_tag_boundary() {
+        let tag = "t".repeat(MAX_TAG);
+        let mut buf = Vec::new();
+        write_frame(&mut buf, 1, &tag, b"").unwrap();
+        let mut cur = std::io::Cursor::new(buf);
+        let (_seq, got_tag, _payload) =
+            read_frame(&mut cur).expect("a tag of exactly MAX_TAG must be accepted");
+        assert_eq!(got_tag.len(), MAX_TAG);
+    }
 
     struct Source;
     impl Strand for Source {

@@ -58,8 +58,21 @@ misbehaving, and must shut down cleanly.
   defense-in-depth. Audited the other crates: all remaining `.lock().unwrap()`
   are test/example code (edge production code uses no shared mutexes). Test:
   `lock_tolerant_recovers_a_poisoned_mutex`.
-- [ ] **No-panic error paths.** Triage the `unwrap`/`expect` sites; convert the
-  reachable-on-bad-input ones to handled errors.
+- [x] **No-panic error paths.** Triaged every `unwrap`/`expect`/`panic!`/
+  `unreachable!` in production code (independent sweep of kernel, fabric graph
+  math, heat kernel, edge, spider). Finding: the one untrusted-input surface —
+  the edge wire parser `read_frame` — was already panic-free and bounds-checks
+  every length *before* allocating. The rest are genuine invariants
+  (`unreachable!` after a `TypeId` guard; closure keyed by its own `TypeId`;
+  `registry()` self-initializes so `as_ref().unwrap()` is always `Some`),
+  setup-time fail-fast guards (duplicate name / second spider, one-shot run),
+  or panics now contained by `catch_unwind` (unregistered fan-out type → clean
+  `Crashed`). No reachable-on-bad-input panic remained to convert. Hardened the
+  parser's testability: `read_frame`/`write_frame` are now `impl Read`/`Write`
+  generic so the untrusted parser is unit-testable in isolation, with 8
+  robustness tests (oversized tag/payload rejected pre-allocation, seq-0,
+  non-UTF8 tag, truncation, empty stream, MAX boundary, round-trip). This also
+  pre-advances Phase 4's fuzz target.
 
 ## Phase 2 — Observability & operability (can't run what you can't see)
 - [ ] **Structured telemetry.** Replace `spider.log(&str)` strings with
