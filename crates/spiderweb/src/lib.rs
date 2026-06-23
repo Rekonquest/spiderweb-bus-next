@@ -26,6 +26,37 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 // -----------------------------------------------------------------------------
+// Poison-tolerant locking
+// -----------------------------------------------------------------------------
+
+/// Lock a [`Mutex`] without propagating poison.
+///
+/// `std::sync::Mutex` poisons when a thread panics while holding the guard.
+/// With the usual `.lock_tolerant()`, the *next* thread to lock then panics
+/// too — so a single fault anywhere in a kernel critical section cascades into
+/// every lock site and kills the whole bus. That is the opposite of what a
+/// production bus should do.
+///
+/// All of the kernel's guarded state is plain data — `HashMap`s, `Vec`s, the
+/// fabric graph. A panic mid-update can leave it partially written but never
+/// memory-unsafe (this crate is `#![forbid(unsafe_code)]`), so recovering the
+/// inner guard and carrying on is strictly safer than propagating the poison.
+/// This is the defensive half; the kernel also keeps panics *out* of these
+/// sections in the first place (strands run lock-free; the sections do only
+/// infallible map/vec/graph ops). Belt and braces.
+trait LockTolerant<T> {
+    /// Acquire the guard, recovering it even if the mutex was poisoned.
+    fn lock_tolerant(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> LockTolerant<T> for Mutex<T> {
+    #[inline]
+    fn lock_tolerant(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Socket
 // -----------------------------------------------------------------------------
 
@@ -830,7 +861,7 @@ impl CloneRegistry {
 static CLONE_REGISTRY: Mutex<Option<CloneRegistry>> = Mutex::new(None);
 
 fn registry() -> std::sync::MutexGuard<'static, Option<CloneRegistry>> {
-    let mut guard = CLONE_REGISTRY.lock().unwrap();
+    let mut guard = CLONE_REGISTRY.lock_tolerant();
     if guard.is_none() {
         *guard = Some(CloneRegistry::new());
     }
@@ -1223,7 +1254,7 @@ impl Kernel {
             .name(format!("strand-{}", slot.name))
             .spawn(move || run_strand_worker(first_strand, kernel_c, slot_c, done_tx_c, inbox_rx))
             .expect("failed to spawn strand thread");
-        *slot.join.lock().unwrap() = Some(handle);
+        *slot.join.lock_tolerant() = Some(handle);
 
         slot
     }
@@ -1261,7 +1292,7 @@ impl Kernel {
             .name(format!("strand-{}", name))
             .spawn(move || run_strand_worker(strand, kernel_c, slot_c, done_tx_c, inbox_rx))
             .expect("failed to spawn strand thread");
-        *slot.join.lock().unwrap() = Some(handle);
+        *slot.join.lock_tolerant() = Some(handle);
 
         slot
     }
@@ -1298,8 +1329,8 @@ impl Kernel {
         // (as before) let a message slip into both paths — a double
         // delivery — or neither — a lost message.
         let flush_event = {
-            let mut subs = self.subscribers.lock().unwrap();
-            let pending = self.pending.lock().unwrap();
+            let mut subs = self.subscribers.lock_tolerant();
+            let pending = self.pending.lock_tolerant();
 
             let evt = match pending.get(&type_id) {
                 Some(buf) if !buf.is_empty() => {
@@ -1365,7 +1396,7 @@ impl Kernel {
         let (out_tag, formed): (Tag, Option<ThreadId>) = if reserved {
             (tag, None)
         } else {
-            self.fabric.lock().unwrap().outbound(from_name, tag)
+            self.fabric.lock_tolerant().outbound(from_name, tag)
         };
         // A fan-out from a default (Stay) node branches the lineage:
         // each extra subscriber gets its own forked sibling thread, so
@@ -1374,7 +1405,7 @@ impl Kernel {
         let forking = !reserved && out_tag.is_some() && {
             // Cheap pre-check; the real per-branch forks happen below
             // once we know how many distinct subscribers there are.
-            self.fabric.lock().unwrap().is_stay(from_name)
+            self.fabric.lock_tolerant().is_stay(from_name)
         };
 
         // Critical section: append to the buffer and snapshot the
@@ -1387,8 +1418,8 @@ impl Kernel {
         // the subscriber Arcs and send AFTER releasing the locks, so we
         // never hold the registry lock while holding these two.
         let (snapshot, was_empty) = {
-            let subs = self.subscribers.lock().unwrap();
-            let mut pending = self.pending.lock().unwrap();
+            let subs = self.subscribers.lock_tolerant();
+            let mut pending = self.pending.lock_tolerant();
 
             let buf = pending.entry(type_id).or_default();
             let was_empty = buf.is_empty();
@@ -1410,7 +1441,7 @@ impl Kernel {
         // edge), so forking only changes the live sends.
         let sub_tags: Vec<Tag> = if forking && snapshot.len() > 1 {
             let parent = out_tag.expect("forking implies out_tag is Some");
-            let mut fabric = self.fabric.lock().unwrap();
+            let mut fabric = self.fabric.lock_tolerant();
             snapshot
                 .iter()
                 .enumerate()
@@ -1451,7 +1482,7 @@ impl Kernel {
         // replays are not counted — a minor under-count on relative
         // conductance, not a corruption.)
         if !reserved && !snapshot.is_empty() {
-            let mut fabric = self.fabric.lock().unwrap();
+            let mut fabric = self.fabric.lock_tolerant();
             for sub in &snapshot {
                 fabric.record_traffic(from_name, &sub.name);
             }
@@ -1481,7 +1512,7 @@ impl Kernel {
     fn record_arrivals(&self, node: &str, inbox: &[Carrier]) {
         let mut events = Vec::new();
         {
-            let mut fabric = self.fabric.lock().unwrap();
+            let mut fabric = self.fabric.lock_tolerant();
             for (sock, tag, _env) in inbox {
                 if is_reserved(sock) {
                     continue;
@@ -1498,7 +1529,7 @@ impl Kernel {
 
     fn deliver_internal(&self, socket: &'static str, env: Envelope, from_name: &str) {
         let type_id = (*env).type_id();
-        let subs = self.subscribers.lock().unwrap();
+        let subs = self.subscribers.lock_tolerant();
         let candidates = match subs.get(&type_id) {
             Some(c) if !c.is_empty() => c,
             _ => return,
@@ -1672,7 +1703,7 @@ impl Bus {
         self.detect_collision(&name);
         let strand_box: Box<dyn Strand> = Box::new(strand);
         let slot = self.kernel.install_live(strand_box);
-        self.kernel.slots.lock().unwrap().insert(name, slot);
+        self.kernel.slots.lock_tolerant().insert(name, slot);
     }
 
     pub fn register_spec(&mut self, spec: StrandSpec) {
@@ -1692,7 +1723,7 @@ impl Bus {
     /// is a panic.
     pub fn register_spider(&mut self, spec: StrandSpec) {
         self.detect_collision_str(spec.name);
-        let mut spider_name = self.kernel.spider_name.lock().unwrap();
+        let mut spider_name = self.kernel.spider_name.lock_tolerant();
         if spider_name.is_some() {
             panic!(
                 "register_spider called twice; only one spider is supported in v1.2"
@@ -1707,7 +1738,7 @@ impl Bus {
     /// silently overwrite, which leaked the first slot's
     /// `done_rx` and made its `WorkerExit` unprocessable.
     fn detect_collision(&self, name: &str) {
-        let slots = self.kernel.slots.lock().unwrap();
+        let slots = self.kernel.slots.lock_tolerant();
         if slots.contains_key(name) {
             panic!(
                 "strand name collision: `{}` is already registered; \
@@ -1739,7 +1770,7 @@ impl Bus {
     /// fabric accretes from traffic, so call this after (or during) a
     /// run. Holds no locks once returned.
     pub fn fabric_snapshot(&self) -> FabricSnapshot {
-        self.kernel.fabric.lock().unwrap().snapshot()
+        self.kernel.fabric.lock_tolerant().snapshot()
     }
 
     /// Set the transfer policy at an intersection `node`. May be called
@@ -1749,7 +1780,7 @@ impl Bus {
     /// observational unless explicitly governed here or via
     /// [`ControlMsg::SetTransfer`].
     pub fn set_transfer(&mut self, node: &str, policy: TransferPolicy) {
-        self.kernel.fabric.lock().unwrap().set_transfer(node, policy);
+        self.kernel.fabric.lock_tolerant().set_transfer(node, policy);
     }
 
     /// Place `node` at a position in the web's 3D space. Pure metadata —
@@ -1758,7 +1789,7 @@ impl Bus {
     /// organization, and spider policy (e.g. distance-attenuated
     /// vibrations). Overrides any advertised position (operator wins).
     pub fn place(&mut self, node: &str, pos: Position) {
-        self.kernel.fabric.lock().unwrap().set_position(node, pos);
+        self.kernel.fabric.lock_tolerant().set_position(node, pos);
     }
 
     /// Run the bus forever (until every strand is terminally done, Ctrl-C, or
@@ -1795,7 +1826,7 @@ impl Bus {
             let name = spec.name;
             let factory = spec.factory;
             let slot = kernel.install_slot(name, Some(factory));
-            kernel.slots.lock().unwrap().insert(name.to_string(), slot);
+            kernel.slots.lock_tolerant().insert(name.to_string(), slot);
         }
 
         // Per-strand restart attempt counter, used ONLY to label
@@ -1807,11 +1838,11 @@ impl Bus {
         let mut pending_restarts: HashMap<String, u32> = HashMap::new();
         let start = Instant::now();
         let mut done_count: usize = 0;
-        let total_slots: usize = kernel.slots.lock().unwrap().len();
+        let total_slots: usize = kernel.slots.lock_tolerant().len();
 
         // Read the control_rx out of the kernel so we can poll it
         // in the main loop.
-        let control_rx = kernel.control_rx.lock().unwrap().take().expect(
+        let control_rx = kernel.control_rx.lock_tolerant().take().expect(
             "kernel control channel already taken; this is a bug in the kernel",
         );
 
@@ -1845,7 +1876,7 @@ impl Bus {
                             match factory_opt {
                                 Some(factory) => {
                                     let new_slot = kernel.restart_slot(name.as_str(), factory);
-                                    kernel.slots.lock().unwrap().insert(name.clone(), new_slot);
+                                    kernel.slots.lock_tolerant().insert(name.clone(), new_slot);
                                     let attempt = pending_restarts.entry(name.clone()).or_insert(0);
                                     *attempt += 1;
                                     kernel.publish_lifecycle(LifecycleEvent::Restarted {
@@ -1877,7 +1908,7 @@ impl Bus {
                                 reason: reason.clone(),
                             });
                             let removed =
-                                kernel.slots.lock().unwrap().remove(name.as_str()).is_some();
+                                kernel.slots.lock_tolerant().remove(name.as_str()).is_some();
                             if removed {
                                 done_count += 1;
                             }
@@ -1893,7 +1924,7 @@ impl Bus {
                             break 'run;
                         }
                         ControlMsg::SetTransfer { node, policy } => {
-                            kernel.fabric.lock().unwrap().set_transfer(node, *policy);
+                            kernel.fabric.lock_tolerant().set_transfer(node, *policy);
                             println!(
                                 "[{:>5}ms] [kernel] 🔀 transfer policy at `{}` set to {:?}",
                                 kernel.boot.elapsed().as_millis(),
@@ -1909,14 +1940,14 @@ impl Bus {
             // restart — the spider does, by sending ControlMsg::Restart.
             // The kernel removes the slot. If the spider doesn't act
             // within a tick, the slot stays gone.
-            let slots = kernel.slots.lock().unwrap().clone();
+            let slots = kernel.slots.lock_tolerant().clone();
 
             for (name, slot) in slots.iter() {
-                let done_rx_opt = slot.done_rx.lock().unwrap().take();
+                let done_rx_opt = slot.done_rx.lock_tolerant().take();
                 let Some(done_rx) = done_rx_opt else { continue };
                 match done_rx.try_recv() {
                     Ok(WorkerExit::Detach) => {
-                        kernel.slots.lock().unwrap().remove(name);
+                        kernel.slots.lock_tolerant().remove(name);
                         done_count += 1;
                     }
                     Ok(WorkerExit::Crashed(_reason)) => {
@@ -1946,14 +1977,14 @@ impl Bus {
                         // forever. This is accounting, not policy — the
                         // kernel still restarts nothing on its own.
                         let has_spider =
-                            kernel.spider_name.lock().unwrap().is_some();
+                            kernel.spider_name.lock_tolerant().is_some();
                         if !has_spider {
-                            kernel.slots.lock().unwrap().remove(name);
+                            kernel.slots.lock_tolerant().remove(name);
                             done_count += 1;
                         }
                     }
                     Err(_) => {
-                        *slot.done_rx.lock().unwrap() = Some(done_rx);
+                        *slot.done_rx.lock_tolerant() = Some(done_rx);
                     }
                 }
             }
@@ -1982,10 +2013,10 @@ impl Bus {
             .shutdown
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let joins: Vec<JoinHandle<()>> = {
-            let slots = kernel.slots.lock().unwrap();
+            let slots = kernel.slots.lock_tolerant();
             slots
                 .values()
-                .filter_map(|slot| slot.join.lock().unwrap().take())
+                .filter_map(|slot| slot.join.lock_tolerant().take())
                 .collect()
         };
         let pending = joins.len();
@@ -2058,6 +2089,37 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
 
+    // ----- Poison tolerance -------------------------------------------------
+
+    /// `lock_tolerant` must recover a poisoned mutex instead of panicking, so a
+    /// single panic in a kernel critical section cannot cascade into every
+    /// later lock site and kill the bus. We poison a mutex (panic while holding
+    /// the guard on another thread), confirm a plain `.lock()` now reports
+    /// poison, then confirm `lock_tolerant()` still hands back the inner value.
+    #[test]
+    fn lock_tolerant_recovers_a_poisoned_mutex() {
+        let m = Arc::new(Mutex::new(7u32));
+        let m2 = m.clone();
+
+        // Poison it: take the guard, then panic. The panic is caught by the
+        // joining thread; the mutex is left poisoned.
+        let _ = std::thread::spawn(move || {
+            let _guard = m2.lock().unwrap();
+            panic!("poison the mutex");
+        })
+        .join();
+
+        assert!(
+            m.lock().is_err(),
+            "sanity: the mutex should be poisoned after a panic-while-held"
+        );
+        let guard = m.lock_tolerant();
+        assert_eq!(
+            *guard, 7,
+            "lock_tolerant must recover the inner value despite poison"
+        );
+    }
+
     // ----- Test strands -----------------------------------------------------
 
     /// A test source that publishes a fixed list of strings and
@@ -2123,7 +2185,7 @@ mod tests {
             let msgs = bus.recv_all::<String>()?;
             for (_sock, msg) in msgs {
                 self.count.fetch_add(1, Ordering::SeqCst);
-                *self.last.lock().unwrap() = msg;
+                *self.last.lock_tolerant() = msg;
             }
             bus.sleep(Duration::from_millis(20));
             Ok(())
@@ -2197,7 +2259,7 @@ mod tests {
         fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
             let msgs = bus.recv_all::<CustomPayload>()?;
             for (_sock, msg) in msgs {
-                *self.last.lock().unwrap() = Some(msg);
+                *self.last.lock_tolerant() = Some(msg);
             }
             bus.sleep(Duration::from_millis(20));
             Ok(())
@@ -2295,8 +2357,8 @@ mod tests {
 
         assert_eq!(count_a.load(Ordering::SeqCst), 3, "sink-A should see all 3 messages");
         assert_eq!(count_b.load(Ordering::SeqCst), 3, "sink-B should see all 3 messages");
-        assert_eq!(*last_a.lock().unwrap(), "third");
-        assert_eq!(*last_b.lock().unwrap(), "third");
+        assert_eq!(*last_a.lock_tolerant(), "third");
+        assert_eq!(*last_b.lock_tolerant(), "third");
     }
 
     /// The kernel buffers publishes that arrive before a subscriber
@@ -2338,7 +2400,7 @@ mod tests {
         let got = count.load(Ordering::SeqCst);
         assert_eq!(got, 2, "sink should have received exactly 2 messages (got {})", got);
         // And the last message we observed should be one we sent.
-        let last_str = last.lock().unwrap().clone();
+        let last_str = last.lock_tolerant().clone();
         assert!(
             last_str.starts_with("buffered-"),
             "last message should be one we sent, got `{}`",
@@ -2366,7 +2428,7 @@ mod tests {
             let msgs = bus.recv_all::<String>()?;
             for (_sock, msg) in msgs {
                 self.count.fetch_add(1, Ordering::SeqCst);
-                *self.last.lock().unwrap() = msg;
+                *self.last.lock_tolerant() = msg;
             }
             bus.sleep(Duration::from_millis(20));
             Ok(())
@@ -2462,8 +2524,8 @@ mod tests {
         bus.run_until(Some(Duration::from_millis(200)));
 
         assert_eq!(published.load(Ordering::SeqCst), 1);
-        let a = last_a.lock().unwrap().clone();
-        let b = last_b.lock().unwrap().clone();
+        let a = last_a.lock_tolerant().clone();
+        let b = last_b.lock_tolerant().clone();
         assert_eq!(a, Some(payload.clone()), "sink-A should see the exact payload");
         assert_eq!(b, Some(payload.clone()), "sink-B should see the exact payload");
     }

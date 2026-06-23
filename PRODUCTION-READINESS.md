@@ -49,9 +49,15 @@ misbehaving, and must shut down cleanly.
   `shutdown_joins_a_parked_crashed_slot_without_hanging`,
   `cooperative_strand_exits_via_is_shutting_down`,
   `wedged_strand_does_not_hang_shutdown`. Reviewed (single-agent).
-- [ ] **Kernel poison-tolerance.** Audit `.lock().unwrap()` sites; a panic in
-  the kernel's own lock-holding sections (deliver/subscribe) poisons the mutex
-  and cascades. Recover from / avoid poison rather than propagate it.
+- [x] **Kernel poison-tolerance.** All 41 kernel `.lock().unwrap()` sites now
+  use a `LockTolerant::lock_tolerant()` helper that recovers the inner guard on
+  poison (`unwrap_or_else(into_inner)`), so a panic in any critical section
+  can't cascade into every later lock site and kill the bus. Guarded state is
+  plain data (maps/vecs/fabric) — partial-update-safe under `forbid(unsafe)` —
+  and the sections are panic-free by design (strands run lock-free); this is
+  defense-in-depth. Audited the other crates: all remaining `.lock().unwrap()`
+  are test/example code (edge production code uses no shared mutexes). Test:
+  `lock_tolerant_recovers_a_poisoned_mutex`.
 - [ ] **No-panic error paths.** Triage the `unwrap`/`expect` sites; convert the
   reachable-on-bad-input ones to handled errors.
 
