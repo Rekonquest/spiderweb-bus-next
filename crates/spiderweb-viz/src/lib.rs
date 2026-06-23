@@ -13,7 +13,7 @@
 
 #![forbid(unsafe_code)]
 
-use spiderweb::FabricSnapshot;
+use spiderweb::{BusStats, FabricSnapshot};
 
 /// Render the geometric fabric as a JSON scene:
 /// `{ "nodes":[{name,x,y,z}], "threads":[{id,polyline:[[x,y,z],...]}],
@@ -256,6 +256,58 @@ addEventListener('resize', () => {
 </html>
 "#;
 
+/// Render a [`BusStats`] as a compact terminal "top" dashboard: web-wide
+/// counters, the lifecycle tally, and a per-strand throughput table. Pure
+/// formatting — the caller pulls the stats (`Bus::stats()` / `BusHandle::stats()`)
+/// and prints the result, optionally clearing the screen between frames for a
+/// live `webctl top` view. Std-only, no dependencies.
+pub fn render_top(stats: &BusStats) -> String {
+    use std::fmt::Write;
+    const RULE: &str = "────────────────────────────────────────────────────────";
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "🕸️  spiderweb top — {} strands · {} subscribers · {} nodes / {} edges",
+        stats.active_strands, stats.subscribers, stats.nodes, stats.edges
+    );
+    let _ = writeln!(s, "{RULE}");
+    let _ = writeln!(
+        s,
+        "  delivered  {:>10}      buffered     {:>10}",
+        stats.delivered, stats.buffered
+    );
+    let _ = writeln!(
+        s,
+        "  vibrations {:>10}      flushed      {:>10}",
+        stats.vibrations, stats.flushed
+    );
+    let _ = writeln!(
+        s,
+        "  evictions  {:>10}      edge traffic {:>10}",
+        stats.pending_evictions, stats.edge_traffic_total
+    );
+    let _ = writeln!(
+        s,
+        "  threads    {:>10}      intersections{:>10}",
+        stats.threads, stats.intersections
+    );
+    let _ = writeln!(s, "{RULE}");
+    let _ = writeln!(
+        s,
+        "  lifecycle: reg {} · restart {} · crash {} · detach {} · quarantine {}",
+        stats.registered, stats.restarted, stats.crashed, stats.detached, stats.quarantined
+    );
+    let _ = writeln!(s, "{RULE}");
+    let _ = writeln!(s, "  {:<32}{:>12}", "STRAND", "PROCESSED");
+    if stats.per_strand.is_empty() {
+        let _ = writeln!(s, "  (no strands)");
+    }
+    for st in &stats.per_strand {
+        let _ = writeln!(s, "  {:<32}{:>12}", st.name, st.processed);
+    }
+    s
+}
+
 /// Minimal JSON string escaping (the node names are simple, but be safe).
 fn json_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -325,5 +377,41 @@ mod tests {
         assert!(json.contains("\"name\":\"ok\""), "finite node kept");
         assert!(!json.contains("bad"), "non-finite node dropped");
         assert!(!json.contains("NaN") && !json.contains("inf"), "no invalid JSON tokens");
+    }
+
+    /// The `top` dashboard renders the header, the counters, and a per-strand
+    /// throughput row for each strand.
+    #[test]
+    fn render_top_shows_counters_and_per_strand() {
+        let stats = BusStats {
+            delivered: 1234,
+            vibrations: 7,
+            crashed: 2,
+            restarted: 1,
+            active_strands: 2,
+            subscribers: 3,
+            nodes: 2,
+            edges: 1,
+            threads: 4,
+            per_strand: vec![
+                spiderweb::StrandStats { name: "sink".into(), processed: 100 },
+                spiderweb::StrandStats { name: "source".into(), processed: 42 },
+            ],
+            ..Default::default()
+        };
+        let out = render_top(&stats);
+        assert!(out.contains("spiderweb top"), "has a header");
+        assert!(out.contains("1234"), "shows delivered count");
+        assert!(out.contains("crash 2"), "shows lifecycle crash count");
+        assert!(out.contains("sink") && out.contains("100"), "shows a per-strand row");
+        assert!(out.contains("source") && out.contains("42"), "shows the other strand");
+    }
+
+    /// With no strands the dashboard still renders (no panic, shows a marker).
+    #[test]
+    fn render_top_handles_empty() {
+        let out = render_top(&BusStats::default());
+        assert!(out.contains("spiderweb top"));
+        assert!(out.contains("(no strands)"));
     }
 }
