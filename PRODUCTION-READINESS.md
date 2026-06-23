@@ -36,6 +36,30 @@ model (`spiderweb-edge` is plaintext, trusted-network only). Deploy the edge on
 a trusted network now; harden for a hostile network when the crypto direction is
 chosen.
 
+### Post-audit hardening pass (2026-06-23)
+
+A multi-agent deliverable audit (four area auditors reading the real fork code)
+confirmed every Phase 1/2/3/4/5 claim and surfaced five genuine findings — all
+now fixed and regression-tested:
+
+- **HIGH** — worker outbox delivery ran *outside* `catch_unwind`, so a fan-out
+  clone of an unregistered type (`clone_env` panics) killed the worker silently
+  and could hang `Bus::run()`. Delivery moved inside the panic boundary →
+  clean `Crashed`. Test: `unregistered_fan_out_type_becomes_clean_crashed_not_silent_death`.
+- **MEDIUM** — two raw `.lock().unwrap()` survived the poison sweep (hot
+  `Restart` arm + boot) → both `lock_tolerant()`.
+- **MEDIUM** — session-dedup oscillation (A→B→A) re-delivered a replayed ring
+  as duplicates (exactly-once violation) → bounded per-session high-water map.
+  Test: `oscillating_sessions_do_not_re_deliver_a_replayed_ring`.
+- **LOW** — `write_frame` length cast to `u32` without bounds → added the caps
+  `read_frame` already enforces.
+- **LOW/doc** — half-open-connection 30s recovery-latency caveat documented.
+
+(The audit's synthesis agent emitted a spurious "not deliverable" verdict — it
+checked the *baseline* repo at `159ddca` instead of the fork; the four area
+auditors all read the fork via absolute paths and verified it. The verdict was a
+wrong-directory artifact, not a real gap.)
+
 ---
 
 ## Phase 1 — Robustness (the bus must not fall over)
