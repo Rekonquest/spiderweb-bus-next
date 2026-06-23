@@ -1021,6 +1021,21 @@ impl BusHandle {
         thread::sleep(d);
     }
 
+    /// Whether the bus has begun winding down. A strand that does any
+    /// long-running or blocking work *inside* `run()` (a loop, a polled
+    /// socket read with a timeout) should check this and return promptly
+    /// when it is `true`, so graceful shutdown can join its worker. The
+    /// kernel exposes the flag (mechanism); honoring it is the strand's
+    /// job (policy). The kernel cannot forcibly cancel a thread blocked in
+    /// a syscall — that is a real wall in safe Rust — so a strand that
+    /// ignores this and blocks forever will be detached after a bounded
+    /// wait rather than joined.
+    pub fn is_shutting_down(&self) -> bool {
+        self.kernel
+            .shutdown
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn take_outbox(&mut self) -> Vec<Carrier> {
         std::mem::take(&mut self.outbox)
     }
@@ -1117,6 +1132,16 @@ struct Kernel {
     /// crash). It is kept as the single-spider guard and for
     /// introspection.
     spider_name: Mutex<Option<String>>,
+    /// Cooperative shutdown flag. Set once when `run_until` is winding
+    /// down (max duration, all-done, or `ControlMsg::Shutdown`). Every
+    /// strand worker checks it at the top of each tick and returns when
+    /// it is set, so the worker thread ends and its strand is DROPPED
+    /// (its `Drop` runs — releasing sockets, joining child threads, etc.).
+    /// Without this, workers spin forever after `run_until` returns and
+    /// strands are never dropped (leaked threads/ports). Relaxed ordering
+    /// is sufficient: it is a one-way latch, and the subsequent thread
+    /// `join` is the real happens-before edge.
+    shutdown: std::sync::atomic::AtomicBool,
 }
 
 impl Kernel {
@@ -1138,6 +1163,7 @@ impl Kernel {
             fabric: Mutex::new(Fabric::default()),
             control_rx: Mutex::new(Some(control_rx)),
             spider_name: Mutex::new(None),
+            shutdown: std::sync::atomic::AtomicBool::new(false),
         });
 
         kernel
@@ -1529,6 +1555,18 @@ fn run_strand_worker(
     }
 
     loop {
+        // Cooperative shutdown: the kernel has begun winding down. Return
+        // so this thread ends and `strand` is dropped (its `Drop` runs).
+        // This is neither a crash nor a detach — emit no lifecycle event;
+        // `run_until` has already left its accounting loop and is now
+        // joining us. (A strand that blocks indefinitely inside `run()`
+        // will delay this check by exactly that long — the shutdown
+        // contract is cooperative, one tick of latency at most for a
+        // well-behaved strand.)
+        if kernel.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+
         let mut inbox: Vec<Carrier> = Vec::new();
         for (sock, tag, env) in inbox_rx.try_iter() {
             inbox.push((sock, tag, env));
@@ -1743,6 +1781,12 @@ impl Bus {
     /// Takes `&mut self` (not `self`) so the fabric can be inspected
     /// with [`Bus::fabric_snapshot`] after the run returns — the binding
     /// must therefore be `mut`. (v1.3 changed this from by-value `self`.)
+    ///
+    /// **One-shot.** Despite the `&mut self` borrow, a given `Bus` runs
+    /// exactly once: this method takes ownership of the kernel's control
+    /// channel and latches the shutdown flag, so a second call panics. The
+    /// `&mut` is only to permit post-run `fabric_snapshot` inspection, not
+    /// to support re-running. Build a fresh `Bus` to run again.
     pub fn run_until(&mut self, max_duration: Option<Duration>) {
         let kernel = self.kernel.clone();
         let mut specs = std::mem::take(&mut self.specs);
@@ -1771,14 +1815,14 @@ impl Bus {
             "kernel control channel already taken; this is a bug in the kernel",
         );
 
-        loop {
+        'run: loop {
             if let Some(d) = max_duration {
                 if start.elapsed() >= d {
                     println!(
                         "[{:>5}ms] [kernel] ⏹  max duration reached, shutting down",
                         kernel.boot.elapsed().as_millis()
                     );
-                    break;
+                    break 'run;
                 }
             }
 
@@ -1843,7 +1887,10 @@ impl Bus {
                                 "[{:>5}ms] [kernel] ⏹  shutdown requested via sys.control",
                                 kernel.boot.elapsed().as_millis()
                             );
-                            return;
+                            // Wind down through the shared path (signal +
+                            // join), not a bare return — so strands are
+                            // dropped here too.
+                            break 'run;
                         }
                         ControlMsg::SetTransfer { node, policy } => {
                             kernel.fabric.lock().unwrap().set_transfer(node, *policy);
@@ -1916,10 +1963,72 @@ impl Bus {
                     "[{:>5}ms] [kernel] ⏹  all strands done, shutting down",
                     kernel.boot.elapsed().as_millis()
                 );
-                break;
+                break 'run;
             }
 
             thread::sleep(Duration::from_millis(50));
+        }
+
+        // Graceful shutdown. Every exit from the run loop lands here.
+        // Signal all workers to stop, then JOIN them so each strand is
+        // actually dropped (its `Drop` runs — e.g. an EdgeListener tears
+        // down its reader thread and releases its bound port) before
+        // `run_until` returns. Workers that already exited (detached,
+        // crashed, quarantined) had their slots removed from the map; we
+        // join whatever live workers remain. Parked (crashed-with-spider)
+        // slots stay in the map; their thread already returned, so the
+        // join completes instantly.
+        kernel
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let joins: Vec<JoinHandle<()>> = {
+            let slots = kernel.slots.lock().unwrap();
+            slots
+                .values()
+                .filter_map(|slot| slot.join.lock().unwrap().take())
+                .collect()
+        };
+        let pending = joins.len();
+        if pending > 0 {
+            // Best-effort BOUNDED join. A well-behaved strand returns within
+            // a tick of seeing the flag, so this resolves almost instantly.
+            // But a strand that blocks indefinitely inside `run()` (a wedged
+            // socket read, a too-long sleep) can never be force-killed in
+            // safe Rust — joining it directly would hang shutdown forever.
+            // So we join on a helper thread and cap the wait: past the
+            // deadline we warn and return, leaving the stuck worker detached
+            // (it dies with the process). The bus shutting down cleanly is
+            // worth more than waiting on one misbehaving strand.
+            const WORKER_JOIN_DEADLINE: Duration = Duration::from_secs(5);
+            let (fin_tx, fin_rx) = mpsc::channel();
+            thread::Builder::new()
+                .name("strand-joiner".to_string())
+                .spawn(move || {
+                    for handle in joins {
+                        let _ = handle.join();
+                    }
+                    let _ = fin_tx.send(());
+                })
+                .expect("failed to spawn joiner thread");
+            match fin_rx.recv_timeout(WORKER_JOIN_DEADLINE) {
+                Ok(()) => {
+                    println!(
+                        "[{:>5}ms] [kernel] 🧹 joined {} worker(s); strands dropped",
+                        kernel.boot.elapsed().as_millis(),
+                        pending
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[{:>5}ms] [kernel] ⚠️  {} worker(s) did not stop within {:?}; \
+                         detaching — a strand is blocking inside run() and ignoring \
+                         is_shutting_down()",
+                        kernel.boot.elapsed().as_millis(),
+                        pending,
+                        WORKER_JOIN_DEADLINE,
+                    );
+                }
+            }
         }
     }
 }

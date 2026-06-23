@@ -34,9 +34,21 @@ misbehaving, and must shut down cleanly.
   `run_winds_down_after_a_panic_with_no_spider`,
   `a_panicking_strand_does_not_kill_its_neighbor`,
   `panic_message_is_recovered_into_the_crash_reason`. Reviewed (single-agent).
-- [ ] **Graceful shutdown.** Kernel signals workers to stop on `run_until`
-  exit and JOINs their threads, so strands are dropped (their `Drop` runs).
-  Fixes the leaked `EdgeListener` reader thread + bound port.
+- [x] **Graceful shutdown.** Every `run_until` exit (max-duration, all-done,
+  `ControlMsg::Shutdown`) sets a cooperative `shutdown` flag and JOINs the
+  worker threads, so strands are dropped (their `Drop` runs). Workers check the
+  flag at the top of each tick; `BusHandle::is_shutting_down()` lets a
+  long/blocking strand cooperate. The join is **bounded best-effort**: a strand
+  that wedges inside `run()` (uncancellable in safe Rust) is detached after a
+  5s deadline with a warning rather than hanging the bus forever. This makes
+  the strand actually drop, which is the prerequisite for the Phase 3
+  `EdgeListener::Drop` reader-thread/port teardown. Tests: `spider_recovery.rs`
+  — `clean_strand_is_dropped_on_graceful_shutdown`,
+  `spec_strand_is_dropped_on_graceful_shutdown`,
+  `shutdown_message_winds_down_and_drops_strands`,
+  `shutdown_joins_a_parked_crashed_slot_without_hanging`,
+  `cooperative_strand_exits_via_is_shutting_down`,
+  `wedged_strand_does_not_hang_shutdown`. Reviewed (single-agent).
 - [ ] **Kernel poison-tolerance.** Audit `.lock().unwrap()` sites; a panic in
   the kernel's own lock-holding sections (deliver/subscribe) poisons the mutex
   and cascades. Recover from / avoid poison rather than propagate it.
