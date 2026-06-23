@@ -131,8 +131,16 @@ misbehaving, and must shut down cleanly.
 - [ ] **Reliability tier 2.** Unbounded reliability w/ no head-of-line blocking
   (sliding-window RLNC) OR end-to-end ACK windows; frees the ring by receiver
   progress, not age.
-- [ ] **Session IDs.** Fix the sender-restart blackout (restarted sender's
-  reset seqs are dedup'd until they pass the receiver high-water mark).
+- [x] **Session IDs.** Fixed the sender-restart blackout. Each frame now carries
+  a per-process **session id** (monotonic wall-clock nanos, distinct across
+  restarts); the wire frame is `[u64 session][u64 seq][u32 tag_len][tag][u32
+  payload_len][payload]`. The receiver dedups by `(session, seq)` and resets its
+  high-water to 0 the instant a new session appears — so a restarted sender
+  (seqs reset to 1) is recovered cleanly instead of having its low seqs skipped
+  against the old high-water (the multi-thousand-frame blackout). O(1) state
+  (current session + high-water), bounded. Regression test
+  `restarted_sender_recovers_instead_of_blacking_out` (5 frames across a
+  simulated restart, all delivered, no dups).
 - [ ] **Cross-machine causality.** Interval Tree Clock stamp on the wire.
 
 ## Phase 4 — Quality gates (proof, not vibes)

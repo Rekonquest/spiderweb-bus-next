@@ -16,39 +16,35 @@
 //! and `std::sync::mpsc` are all in `std`.
 //!
 //! ## Wire frame
-//! Length-prefixed, big-endian: `[u32 tag_len][tag bytes][u32 payload_len][payload]`.
+//! Length-prefixed, big-endian:
+//! `[u64 session][u64 seq][u32 tag_len][tag bytes][u32 payload_len][payload]`.
 //!
 //! ## Honest MVP scope (these are the *next* hardened layers, not done here)
 //! - **Bounded reliable delivery** (was at-most-once): each frame carries a
-//!   monotonic sequence number and is held in a bounded sender ring
-//!   (`RING_CAP`); on (re)connect the sender replays the ring so the peer
-//!   catches up on anything missed during a disconnect (or before the first
-//!   connect), and the receiver dedups by sequence — so a recovered frame is
-//!   never delivered twice. This recovers losses up to `RING_CAP` frames of
-//!   disconnect. **Honest limits:** beyond the ring bound, frames are lost; it
-//!   assumes ONE long-lived sender whose sequence is monotonic across
-//!   reconnects. A sender *restart* (new process, seq reset to 1) against a
-//!   still-running listener is NOT a brief hiccup: EVERY frame from the
-//!   restarted sender is silently dropped until its seq climbs past the
-//!   receiver's high-water mark — potentially thousands of messages of
-//!   blackout. Fixing that needs a per-session id keyed dedup (the next tier).
-//!   And there is no end-to-end ACK, so the ring frees by age, not by receiver
-//!   progress. Unbounded reliability with no head-of-line blocking
-//!   (sliding-window RLNC / RaptorQ) is the next tier.
+//!   **session id** + a monotonic sequence number and is held in a bounded
+//!   sender ring (`RING_CAP`); on (re)connect the sender replays the ring so the
+//!   peer catches up on anything missed during a disconnect (or before the first
+//!   connect), and the receiver dedups by `(session, seq)` — so a recovered
+//!   frame is never delivered twice. This recovers losses up to `RING_CAP`
+//!   frames of disconnect. A sender **restart** (new process, seqs reset to 1)
+//!   is now recovered cleanly too: the fresh session id makes the receiver reset
+//!   its dedup high-water instead of blacking out the restarted sender's low
+//!   seqs (regression: `restarted_sender_recovers_instead_of_blacking_out`).
+//!   **Honest limits:** beyond the ring bound, frames are lost; and there is no
+//!   end-to-end ACK, so the ring frees by age, not by receiver progress.
+//!   Unbounded reliability with no head-of-line blocking (sliding-window RLNC /
+//!   RaptorQ) is the next tier.
 //! - **No authentication / no encryption**: the wire is plaintext and the peer
 //!   is trusted. Auth (BLS / threshold) + TLS/QUIC are follow-ups — this is the
 //!   trust boundary the bus must *earn*, not assert.
 //! - **No cross-machine causality**: the lineage `Tag` does not cross the wire
 //!   (Interval Tree Clocks are the follow-up).
-//! - The listener's reader thread (and its bound port) **leak until process
-//!   exit**, unconditionally. The kernel never joins or drops strand workers on
-//!   shutdown — `run_until` just returns and the worker loops forever — so the
-//!   `EdgeListener` (and the `Receiver` it owns) is never dropped, and the
-//!   reader's `send`-fails-when-the-receiver-is-dropped stop therefore never
-//!   fires. A real teardown needs **kernel cooperation** (a worker shutdown
-//!   signal); harmless for short-lived tests/demos. The bound socket is not set
-//!   `SO_REUSEADDR`, so an immediate same-process re-bind to a *fixed* port
-//!   could fail (the tests/demo bind port 0).
+//!
+//! (The reader thread + bound port used to leak until process exit; Phase-1
+//! graceful shutdown now drops the strand and [`EdgeListener::drop`] joins the
+//! reader and frees the port. The bound socket is not `SO_REUSEADDR`, so an
+//! immediate same-process re-bind to a *fixed* port could briefly fail; the
+//! tests/demos bind port 0.)
 //!
 //! ## Bounded by construction (the untrusted-input guards)
 //! Frame headers are capped (`MAX_TAG`, `MAX_PAYLOAD`) so a hostile length
@@ -70,7 +66,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// A per-sender-process session id. A sender that RESTARTS resets its sequence
+/// numbers to 1; without a session id the receiver would dedup those reset seqs
+/// against its old high-water mark and silently drop everything until the new
+/// seqs climbed past it (a multi-thousand-frame blackout). Stamping each frame
+/// with a fresh session id (monotonic wall-clock nanos, distinct across
+/// restarts) lets the receiver detect the new session and reset its dedup
+/// high-water — so a restarted sender is recovered cleanly. Collision needs two
+/// senders to start within the same nanosecond; acceptable for this MVP.
+fn new_session() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1)
+}
 
 /// Drain the bridged type off the local bus and return one encoded payload
 /// per message. (Used by [`EdgeSender`].)
@@ -78,6 +89,9 @@ type Pull = Box<dyn Fn(&mut BusHandle) -> Vec<Vec<u8>> + Send>;
 /// Decode one payload and publish it onto the local bus. (Used by
 /// [`EdgeListener`].)
 type Push = Box<dyn Fn(&mut BusHandle, &[u8]) + Send>;
+/// One wire frame in flight, reader thread → listener strand:
+/// `(session, seq, tag, payload)`.
+type Frame = (u64, u64, String, Vec<u8>);
 
 /// Sanity caps so a corrupt/hostile frame header can't trigger a huge alloc.
 const MAX_TAG: usize = 1024;
@@ -197,6 +211,7 @@ impl Edge {
             stream: None,
             socks,
             pulls,
+            session: new_session(),
             next_seq: 1,
             ring: VecDeque::new(),
         }
@@ -214,7 +229,7 @@ impl Edge {
         let listener = TcpListener::bind(addr)?;
         let local_addr = listener.local_addr()?;
         // Bounded: see EDGE_CHANNEL_CAP — backpressure, not unbounded growth.
-        let (tx, rx) = mpsc::sync_channel::<(u64, String, Vec<u8>)>(EDGE_CHANNEL_CAP);
+        let (tx, rx) = mpsc::sync_channel::<Frame>(EDGE_CHANNEL_CAP);
         let shutdown = Arc::new(AtomicBool::new(false));
         let reader_shutdown = shutdown.clone();
         let reader = thread::spawn(move || reader_loop(listener, tx, reader_shutdown));
@@ -234,6 +249,7 @@ impl Edge {
             socks,
             pushes,
             local_addr,
+            session: 0,
             delivered: 0,
             shutdown,
             reader: Some(reader),
@@ -248,6 +264,9 @@ pub struct EdgeSender {
     stream: Option<TcpStream>,
     socks: Vec<Socket>,
     pulls: Vec<(&'static str, Pull)>,
+    /// Per-process session id, stamped on every frame so a sender RESTART is
+    /// recovered cleanly by the receiver instead of blacked out ([`new_session`]).
+    session: u64,
     /// Next sequence to assign (monotonic; starts at 1, so 0 means "none yet").
     next_seq: u64,
     /// Bounded resend ring of recent frames, replayed on (re)connect.
@@ -290,15 +309,16 @@ impl Strand for EdgeSender {
         if reconnecting {
             self.stream = TcpStream::connect(&self.peer).ok();
         }
+        let session = self.session;
         if let Some(stream) = self.stream.as_mut() {
             let result = if reconnecting {
-                self.ring
-                    .iter()
-                    .try_for_each(|(seq, tag, payload)| write_frame(stream, *seq, tag, payload))
+                self.ring.iter().try_for_each(|(seq, tag, payload)| {
+                    write_frame(stream, session, *seq, tag, payload)
+                })
             } else {
-                fresh
-                    .iter()
-                    .try_for_each(|(seq, tag, payload)| write_frame(stream, *seq, tag, payload))
+                fresh.iter().try_for_each(|(seq, tag, payload)| {
+                    write_frame(stream, session, *seq, tag, payload)
+                })
             };
             if result.is_err() {
                 // Peer dropped: reconnect next tick and replay then. Nothing is
@@ -318,13 +338,16 @@ pub struct EdgeListener {
     /// disconnects the channel, instantly unblocking a reader stuck in a full
     /// `tx.send()`, before we join it (otherwise the receiver wouldn't drop
     /// until after `Drop` returns, deadlocking the join).
-    rx: Option<Receiver<(u64, String, Vec<u8>)>>,
+    rx: Option<Receiver<Frame>>,
     socks: Vec<Socket>,
     pushes: Vec<(&'static str, Push)>,
     local_addr: SocketAddr,
-    /// High-water mark of delivered sequence numbers. A reconnect replay
-    /// re-sends already-seen seqs; we skip any `seq <= delivered` so a recovered
-    /// frame is never delivered twice.
+    /// The sender session currently being tracked (0 = none yet). A frame from a
+    /// NEW session resets `delivered` — that is what recovers a restarted sender.
+    session: u64,
+    /// High-water mark of delivered sequence numbers WITHIN `session`. A
+    /// reconnect replay re-sends already-seen seqs; we skip any `seq <=
+    /// delivered` so a recovered frame is never delivered twice.
     delivered: u64,
     /// Set on drop to tell the reader thread to stop accepting.
     shutdown: Arc<AtomicBool>,
@@ -398,12 +421,19 @@ impl Strand for EdgeListener {
     fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
         // `rx` is always `Some` while the strand is alive; it is only taken in
         // `Drop`, after which `run` is never called again.
-        let frames: Vec<(u64, String, Vec<u8>)> = match &self.rx {
+        let frames: Vec<Frame> = match &self.rx {
             Some(rx) => rx.try_iter().collect(),
             None => Vec::new(),
         };
-        for (seq, tag, payload) in frames {
-            // Dedup: seqs are monotonic from the sender, so a reconnect replay
+        for (session, seq, tag, payload) in frames {
+            // A new sender session (e.g. a sender RESTART, which resets seqs to
+            // 1) resets the dedup high-water — otherwise those reset seqs would
+            // be skipped against the old session's mark (the blackout).
+            if session != self.session {
+                self.session = session;
+                self.delivered = 0;
+            }
+            // Dedup: seqs are monotonic within a session, so a reconnect replay
             // re-sends already-seen seqs — skip them.
             if seq <= self.delivered {
                 continue;
@@ -425,11 +455,7 @@ impl Strand for EdgeListener {
 /// disconnects; exits when the receiver (the strand) is dropped OR when
 /// `shutdown` is set (the listener is being dropped — `Drop` self-connects to
 /// wake a blocked `accept()` so this check is reached promptly).
-fn reader_loop(
-    listener: TcpListener,
-    tx: mpsc::SyncSender<(u64, String, Vec<u8>)>,
-    shutdown: Arc<AtomicBool>,
-) {
+fn reader_loop(listener: TcpListener, tx: mpsc::SyncSender<Frame>, shutdown: Arc<AtomicBool>) {
     for conn in listener.incoming() {
         if shutdown.load(Ordering::Acquire) {
             return; // listener dropped: release the port (drop `listener`).
@@ -457,7 +483,14 @@ fn reader_loop(
 /// Write one wire frame to any byte sink. Generic over [`Write`] (not tied to
 /// [`TcpStream`]) so frames can be built into an in-memory buffer for tests and
 /// round-trip checks against [`read_frame`].
-fn write_frame<W: Write>(w: &mut W, seq: u64, tag: &str, payload: &[u8]) -> std::io::Result<()> {
+fn write_frame<W: Write>(
+    w: &mut W,
+    session: u64,
+    seq: u64,
+    tag: &str,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    w.write_all(&session.to_be_bytes())?;
     w.write_all(&seq.to_be_bytes())?;
     let tag_b = tag.as_bytes();
     w.write_all(&(tag_b.len() as u32).to_be_bytes())?;
@@ -472,8 +505,11 @@ fn write_frame<W: Write>(w: &mut W, seq: u64, tag: &str, payload: &[u8]) -> std:
 /// fuzzed in isolation against in-memory byte slices. Every length is bounds-
 /// checked against its cap BEFORE allocating, so a hostile peer cannot induce
 /// a huge allocation or a panic — malformed input always returns `Err`.
-fn read_frame<R: Read>(r: &mut R) -> std::io::Result<(u64, String, Vec<u8>)> {
+fn read_frame<R: Read>(r: &mut R) -> std::io::Result<Frame> {
     use std::io::{Error, ErrorKind};
+    let mut s8 = [0u8; 8];
+    r.read_exact(&mut s8)?;
+    let session = u64::from_be_bytes(s8);
     let mut seq8 = [0u8; 8];
     r.read_exact(&mut seq8)?;
     let seq = u64::from_be_bytes(seq8);
@@ -499,7 +535,7 @@ fn read_frame<R: Read>(r: &mut R) -> std::io::Result<(u64, String, Vec<u8>)> {
     }
     let mut payload = vec![0u8; payload_len];
     r.read_exact(&mut payload)?;
-    Ok((seq, tag, payload))
+    Ok((session, seq, tag, payload))
 }
 
 #[cfg(test)]
@@ -537,7 +573,8 @@ mod tests {
             if iter % 3 == 0 {
                 // Header-shaped: real seq, then an ATTACKER-CHOSEN length prefix
                 // (often enormous) — the case that must be rejected pre-alloc.
-                bytes.extend_from_slice(&(1u64 + (next() & 0xFF)).to_be_bytes());
+                bytes.extend_from_slice(&next().to_be_bytes()); // session
+                bytes.extend_from_slice(&(1u64 + (next() & 0xFF)).to_be_bytes()); // seq
                 bytes.extend_from_slice(&(next() as u32).to_be_bytes()); // tag_len
                 let take = (next() % 40) as usize;
                 for _ in 0..take {
@@ -558,7 +595,7 @@ mod tests {
             let mut cur = std::io::Cursor::new(bytes);
             // The contract: returns, never panics. On success the bounds hold
             // (this is what protects against the giant-allocation attack).
-            if let Ok((seq, tag, payload)) = read_frame(&mut cur) {
+            if let Ok((_session, seq, tag, payload)) = read_frame(&mut cur) {
                 assert!(seq != 0, "seq 0 is reserved and must never parse");
                 assert!(tag.len() <= MAX_TAG, "tag exceeded MAX_TAG");
                 assert!(payload.len() <= MAX_PAYLOAD, "payload exceeded MAX_PAYLOAD");
@@ -570,9 +607,10 @@ mod tests {
     #[test]
     fn frame_round_trips() {
         let mut buf = Vec::new();
-        write_frame(&mut buf, 42, "wire.note", b"hello").unwrap();
+        write_frame(&mut buf, 7, 42, "wire.note", b"hello").unwrap();
         let mut cur = std::io::Cursor::new(buf);
-        let (seq, tag, payload) = read_frame(&mut cur).expect("valid frame should parse");
+        let (session, seq, tag, payload) = read_frame(&mut cur).expect("valid frame should parse");
+        assert_eq!(session, 7);
         assert_eq!(seq, 42);
         assert_eq!(tag, "wire.note");
         assert_eq!(payload, b"hello");
@@ -583,7 +621,8 @@ mod tests {
     fn frame_rejects_reserved_seq_zero() {
         let mut buf = Vec::new();
         // Hand-build a seq-0 frame (write_frame would happily encode it).
-        buf.extend_from_slice(&0u64.to_be_bytes());
+        buf.extend_from_slice(&1u64.to_be_bytes()); // session
+        buf.extend_from_slice(&0u64.to_be_bytes()); // seq (reserved 0)
         buf.extend_from_slice(&3u32.to_be_bytes());
         buf.extend_from_slice(b"abc");
         buf.extend_from_slice(&0u32.to_be_bytes());
@@ -596,8 +635,9 @@ mod tests {
     #[test]
     fn frame_rejects_oversized_tag_without_allocating() {
         let mut buf = Vec::new();
-        buf.extend_from_slice(&1u64.to_be_bytes());
-        // Declare a tag far larger than MAX_TAG; provide no tag bytes.
+        buf.extend_from_slice(&1u64.to_be_bytes()); // session
+        buf.extend_from_slice(&1u64.to_be_bytes()); // seq
+                                                    // Declare a tag far larger than MAX_TAG; provide no tag bytes.
         buf.extend_from_slice(&(u32::MAX).to_be_bytes());
         let mut cur = std::io::Cursor::new(buf);
         let err = read_frame(&mut cur).expect_err("oversized tag must be rejected");
@@ -609,7 +649,8 @@ mod tests {
     #[test]
     fn frame_rejects_oversized_payload_without_allocating() {
         let mut buf = Vec::new();
-        buf.extend_from_slice(&1u64.to_be_bytes());
+        buf.extend_from_slice(&1u64.to_be_bytes()); // session
+        buf.extend_from_slice(&1u64.to_be_bytes()); // seq
         buf.extend_from_slice(&3u32.to_be_bytes());
         buf.extend_from_slice(b"abc");
         buf.extend_from_slice(&(u32::MAX).to_be_bytes()); // payload_len
@@ -623,7 +664,8 @@ mod tests {
     #[test]
     fn frame_rejects_non_utf8_tag() {
         let mut buf = Vec::new();
-        buf.extend_from_slice(&1u64.to_be_bytes());
+        buf.extend_from_slice(&1u64.to_be_bytes()); // session
+        buf.extend_from_slice(&1u64.to_be_bytes()); // seq
         buf.extend_from_slice(&2u32.to_be_bytes());
         buf.extend_from_slice(&[0xff, 0xfe]); // invalid UTF-8
         buf.extend_from_slice(&0u32.to_be_bytes());
@@ -640,7 +682,8 @@ mod tests {
     fn frame_rejects_truncation() {
         // Full header declaring a 10-byte payload, but only 2 bytes follow.
         let mut buf = Vec::new();
-        buf.extend_from_slice(&1u64.to_be_bytes());
+        buf.extend_from_slice(&1u64.to_be_bytes()); // session
+        buf.extend_from_slice(&1u64.to_be_bytes()); // seq
         buf.extend_from_slice(&3u32.to_be_bytes());
         buf.extend_from_slice(b"abc");
         buf.extend_from_slice(&10u32.to_be_bytes());
@@ -667,9 +710,9 @@ mod tests {
     fn frame_accepts_max_tag_boundary() {
         let tag = "t".repeat(MAX_TAG);
         let mut buf = Vec::new();
-        write_frame(&mut buf, 1, &tag, b"").unwrap();
+        write_frame(&mut buf, 1, 1, &tag, b"").unwrap();
         let mut cur = std::io::Cursor::new(buf);
-        let (_seq, got_tag, _payload) =
+        let (_session, _seq, got_tag, _payload) =
             read_frame(&mut cur).expect("a tag of exactly MAX_TAG must be accepted");
         assert_eq!(got_tag.len(), MAX_TAG);
     }
@@ -786,7 +829,7 @@ mod tests {
         // bounded channel and then blocks in tx.send().
         let mut peer = TcpStream::connect(addr).expect("connect peer");
         for i in 1..=(EDGE_CHANNEL_CAP as u64 + 50) {
-            write_frame(&mut peer, i, "note", b"x").expect("write frame");
+            write_frame(&mut peer, 1, i, "note", b"x").expect("write frame");
         }
         // Let the reader pull frames into the now-full channel and block.
         std::thread::sleep(Duration::from_millis(100));
@@ -802,6 +845,65 @@ mod tests {
             "dropping the listener with a full channel + connected peer must not deadlock"
         );
         drop(peer);
+    }
+
+    /// A sender RESTART (new session id, seqs reset to 1) must NOT black out. The
+    /// receiver detects the new session and resets its dedup high-water, so the
+    /// restarted sender's low seqs are delivered instead of skipped against the
+    /// old session's mark. Without session ids, "b1"/"b2" (seq 1,2 <= old
+    /// high-water 3) would be silently dropped — the multi-thousand-frame
+    /// blackout this feature exists to kill.
+    #[test]
+    fn restarted_sender_recovers_instead_of_blacking_out() {
+        use std::io::Write as _;
+        let collected = Arc::new(Mutex::new(Vec::<String>::new()));
+        let listener = Edge::new()
+            .bridge::<String>("note", "wire.note", enc, dec)
+            .listener("edge-in", "127.0.0.1:0")
+            .expect("bind listener");
+        let port = listener.local_addr().port();
+        let c = collected.clone();
+        let bus_thread = thread::spawn(move || {
+            let mut bus = Bus::open();
+            bus.register(listener);
+            bus.register(Collector { sink: c });
+            bus.run_until(Some(Duration::from_millis(900)));
+        });
+        thread::sleep(Duration::from_millis(80)); // let the reader thread start
+
+        // Session A (the original sender): seqs 1,2,3 -> high-water 3.
+        {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect A");
+            for (seq, p) in [(1u64, "a1"), (2, "a2"), (3, "a3")] {
+                write_frame(&mut s, 100, seq, "note", p.as_bytes()).expect("write A");
+            }
+            let _ = s.flush();
+        } // drop closes the connection — the sender "stops"
+        thread::sleep(Duration::from_millis(120));
+
+        // Session B (the RESTARTED sender): fresh session, seqs reset to 1,2.
+        {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect B");
+            for (seq, p) in [(1u64, "b1"), (2, "b2")] {
+                write_frame(&mut s, 200, seq, "note", p.as_bytes()).expect("write B");
+            }
+            let _ = s.flush();
+        }
+        thread::sleep(Duration::from_millis(220));
+        bus_thread.join().unwrap();
+
+        let mut got = collected.lock().unwrap().clone();
+        assert!(
+            got.contains(&"b1".to_string()) && got.contains(&"b2".to_string()),
+            "restarted-sender frames were blacked out (session dedup-reset failed); got {got:?}"
+        );
+        got.sort();
+        got.dedup();
+        assert_eq!(
+            got,
+            vec!["a1", "a2", "a3", "b1", "b2"],
+            "expected exactly the 5 messages across the restart"
+        );
     }
 
     /// A message published on bus A is received by bus B across a REAL TCP
