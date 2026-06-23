@@ -65,7 +65,11 @@ impl Strand for Spider {
                 continue;
             }
             match evt {
-                LifecycleEvent::Registered { name, inputs, outputs } => {
+                LifecycleEvent::Registered {
+                    name,
+                    inputs,
+                    outputs,
+                } => {
                     bus.log(&format!(
                         "👁  {} is online (in: {}, out: {})",
                         name,
@@ -86,7 +90,10 @@ impl Strand for Spider {
                     *count += 1;
                     if *count <= 3 {
                         bus.log(&format!("🔄 {} sending Restart (attempt {})", name, count));
-                        bus.publish_static(SYS_CONTROL, ControlMsg::Restart { name: name.clone() })?;
+                        bus.publish_static(
+                            SYS_CONTROL,
+                            ControlMsg::Restart { name: name.clone() },
+                        )?;
                     } else {
                         bus.log(&format!("🛑 {} sending Quarantine (4th crash)", name));
                         bus.publish_static(

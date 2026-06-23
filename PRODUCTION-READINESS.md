@@ -136,12 +136,26 @@ misbehaving, and must shut down cleanly.
 - [ ] **Cross-machine causality.** Interval Tree Clock stamp on the wire.
 
 ## Phase 4 — Quality gates (proof, not vibes)
-- [ ] **Fuzz the wire parser.** `cargo-fuzz` on `read_frame` (untrusted input).
-- [ ] **Soak/chaos.** Long-run with injected disconnects, panics, floods.
-- [ ] **Property tests.** Exactly-once delivery; heat-kernel mass conservation;
-  fabric conservation invariants under random traffic.
-- [ ] **CI.** `test` + `clippy -D warnings` + `fmt --check` + fuzz corpus on
-  every change.
+- [x] **Fuzz the wire parser.** Std-only, stable-Rust, deterministic randomized
+  fuzz of `read_frame`: 200k adversarial byte streams (uniform-random AND
+  header-shaped with attacker-chosen length prefixes), asserting it never panics
+  and that any accepted frame honors its bounds (seq≠0, tag≤MAX_TAG,
+  payload≤MAX_PAYLOAD). Runs in CI with no nightly/deps; a `cargo-fuzz` target is
+  the documented optional follow-on. (`read_frame_never_panics_on_adversarial_input`.)
+- [x] **Property tests.** Randomized, seeded, std-only: **exactly-once fan-out**
+  across random message/subscriber shapes (`fan_out_is_exactly_once_across_random_shapes`);
+  **heat-kernel mass conservation** over 3000 random graphs at multiple `t`
+  (`mass_conservation_property_on_random_graphs`, also asserts felt-strengths ∈
+  [0,1]). (Fabric edge-conductance invariants already covered by the
+  `adjacency_*` unit tests under all transfer policies.)
+- [~] **Soak/chaos.** Covered by the existing chaos suite — sustained crash/
+  restart churn (`subscriber_map_stays_bounded_under_restart_churn`), a wedged
+  strand (`wedged_strand_does_not_hang_shutdown`), panic-next-to-neighbor, and a
+  flooding-peer teardown — plus the randomized property tests. A single long-run
+  combined soak harness is the remaining nice-to-have.
+- [x] **CI.** `.github/workflows/ci.yml` — `fmt --all --check` + `clippy
+  --workspace --all-targets -D warnings` + `cargo test --workspace` on every
+  push/PR, with build cache. Workspace `fmt`-normalized so the gate is green.
 
 ## Phase 5 — Packaging & docs (shippable)
 - [ ] **Rustdoc complete**; per-crate README; a quickstart example.

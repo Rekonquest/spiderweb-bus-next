@@ -123,7 +123,9 @@ impl Default for Edge {
 
 impl Edge {
     pub fn new() -> Self {
-        Edge { entries: Vec::new() }
+        Edge {
+            entries: Vec::new(),
+        }
     }
 
     /// Bridge messages of type `T` across the wire under a stable `tag`.
@@ -204,7 +206,11 @@ impl Edge {
     /// every received frame onto the local bus. Binding happens now (so the
     /// port is open before the sender connects); a background thread does the
     /// blocking reads and hands frames to the strand over a channel.
-    pub fn listener(self, name: &'static str, addr: impl std::net::ToSocketAddrs) -> std::io::Result<EdgeListener> {
+    pub fn listener(
+        self,
+        name: &'static str,
+        addr: impl std::net::ToSocketAddrs,
+    ) -> std::io::Result<EdgeListener> {
         let listener = TcpListener::bind(addr)?;
         let local_addr = listener.local_addr()?;
         // Bounded: see EDGE_CHANNEL_CAP — backpressure, not unbounded growth.
@@ -483,7 +489,8 @@ fn read_frame<R: Read>(r: &mut R) -> std::io::Result<(u64, String, Vec<u8>)> {
     }
     let mut tag_b = vec![0u8; tag_len];
     r.read_exact(&mut tag_b)?;
-    let tag = String::from_utf8(tag_b).map_err(|_| Error::new(ErrorKind::InvalidData, "tag not utf8"))?;
+    let tag =
+        String::from_utf8(tag_b).map_err(|_| Error::new(ErrorKind::InvalidData, "tag not utf8"))?;
 
     r.read_exact(&mut len4)?;
     let payload_len = u32::from_be_bytes(len4) as usize;
@@ -507,6 +514,57 @@ mod tests {
     // peer must NEVER be able to make it panic or induce a huge allocation —
     // malformed input must always come back as `Err`. These tests drive the
     // (now `impl Read`-generic) parser against in-memory byte slices.
+
+    /// Randomized fuzz of the untrusted wire parser: hammer `read_frame` with a
+    /// huge number of adversarial byte streams (uniform-random AND
+    /// header-shaped, where a plausible-but-hostile length prefix is the real
+    /// attack) and assert it NEVER panics and NEVER violates its bounds. A
+    /// std-only, deterministic, stable-Rust stand-in for cargo-fuzz so it runs
+    /// in CI with no nightly toolchain or external deps. (A cargo-fuzz target is
+    /// the documented optional follow-on for continuous fuzzing.)
+    #[test]
+    fn read_frame_never_panics_on_adversarial_input() {
+        // xorshift64*: deterministic, zero-dep.
+        let mut s: u64 = 0x9E3779B97F4A7C15;
+        let mut next = || {
+            s ^= s >> 12;
+            s ^= s << 25;
+            s ^= s >> 27;
+            s.wrapping_mul(0x2545F4914F6CDD1D)
+        };
+        for iter in 0..200_000u32 {
+            let mut bytes = Vec::new();
+            if iter % 3 == 0 {
+                // Header-shaped: real seq, then an ATTACKER-CHOSEN length prefix
+                // (often enormous) — the case that must be rejected pre-alloc.
+                bytes.extend_from_slice(&(1u64 + (next() & 0xFF)).to_be_bytes());
+                bytes.extend_from_slice(&(next() as u32).to_be_bytes()); // tag_len
+                let take = (next() % 40) as usize;
+                for _ in 0..take {
+                    bytes.push(next() as u8);
+                }
+                bytes.extend_from_slice(&(next() as u32).to_be_bytes()); // payload_len
+                let take2 = (next() % 40) as usize;
+                for _ in 0..take2 {
+                    bytes.push(next() as u8);
+                }
+            } else {
+                // Uniform-random of random length.
+                let len = (next() % 64) as usize;
+                for _ in 0..len {
+                    bytes.push(next() as u8);
+                }
+            }
+            let mut cur = std::io::Cursor::new(bytes);
+            // The contract: returns, never panics. On success the bounds hold
+            // (this is what protects against the giant-allocation attack).
+            if let Ok((seq, tag, payload)) = read_frame(&mut cur) {
+                assert!(seq != 0, "seq 0 is reserved and must never parse");
+                assert!(tag.len() <= MAX_TAG, "tag exceeded MAX_TAG");
+                assert!(payload.len() <= MAX_PAYLOAD, "payload exceeded MAX_PAYLOAD");
+            }
+        }
+    }
 
     /// A well-formed frame round-trips through write_frame → read_frame.
     #[test]
@@ -570,7 +628,10 @@ mod tests {
         buf.extend_from_slice(&[0xff, 0xfe]); // invalid UTF-8
         buf.extend_from_slice(&0u32.to_be_bytes());
         let mut cur = std::io::Cursor::new(buf);
-        assert!(read_frame(&mut cur).is_err(), "non-utf8 tag must be rejected");
+        assert!(
+            read_frame(&mut cur).is_err(),
+            "non-utf8 tag must be rejected"
+        );
     }
 
     /// A truncated frame (header promises more bytes than exist) must return
@@ -593,7 +654,10 @@ mod tests {
     #[test]
     fn frame_handles_empty_stream() {
         let mut cur = std::io::Cursor::new(Vec::<u8>::new());
-        assert!(read_frame(&mut cur).is_err(), "empty stream must error, not hang");
+        assert!(
+            read_frame(&mut cur).is_err(),
+            "empty stream must error, not hang"
+        );
     }
 
     /// Max-size boundary: a tag of exactly MAX_TAG and a payload of exactly
@@ -796,7 +860,10 @@ mod tests {
             &[]
         }
         fn outputs(&self) -> &[Socket] {
-            const S: [Socket; 2] = [Socket::new::<String>("wire.a"), Socket::new::<String>("wire.b")];
+            const S: [Socket; 2] = [
+                Socket::new::<String>("wire.a"),
+                Socket::new::<String>("wire.b"),
+            ];
             &S
         }
         fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
@@ -816,7 +883,12 @@ mod tests {
     }
     impl SocketCollector {
         fn new(name: &'static str, socket: &'static str, sink: Arc<Mutex<Vec<String>>>) -> Self {
-            SocketCollector { name, socket, socket_obj: Socket::new::<String>(socket), sink }
+            SocketCollector {
+                name,
+                socket,
+                socket_obj: Socket::new::<String>(socket),
+                sink,
+            }
         }
     }
     impl Strand for SocketCollector {
@@ -884,10 +956,26 @@ mod tests {
 
         let a = a_sink.lock().unwrap();
         let b = b_sink.lock().unwrap();
-        assert!(a.iter().any(|s| s == "msg-a"), "wire.a should receive msg-a, got {:?}", *a);
-        assert!(!a.iter().any(|s| s == "msg-b"), "wire.a must NOT receive msg-b (cross-tag leak), got {:?}", *a);
-        assert!(b.iter().any(|s| s == "msg-b"), "wire.b should receive msg-b, got {:?}", *b);
-        assert!(!b.iter().any(|s| s == "msg-a"), "wire.b must NOT receive msg-a (cross-tag leak), got {:?}", *b);
+        assert!(
+            a.iter().any(|s| s == "msg-a"),
+            "wire.a should receive msg-a, got {:?}",
+            *a
+        );
+        assert!(
+            !a.iter().any(|s| s == "msg-b"),
+            "wire.a must NOT receive msg-b (cross-tag leak), got {:?}",
+            *a
+        );
+        assert!(
+            b.iter().any(|s| s == "msg-b"),
+            "wire.b should receive msg-b, got {:?}",
+            *b
+        );
+        assert!(
+            !b.iter().any(|s| s == "msg-a"),
+            "wire.b must NOT receive msg-a (cross-tag leak), got {:?}",
+            *b
+        );
     }
 
     /// Publishes 10 distinct messages, once each.

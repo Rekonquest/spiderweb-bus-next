@@ -178,7 +178,10 @@ fn print_fabric(title: &str, snap: &FabricSnapshot) {
 fn main() {
     println!("Run 1: default policy (Stay) — threads keep their identity across the web.");
     let stay = build_and_run(None);
-    print_fabric("DEFAULT (Stay): per-origin threads weave through the web", &stay);
+    print_fabric(
+        "DEFAULT (Stay): per-origin threads weave through the web",
+        &stay,
+    );
 
     println!("\n\nRun 2: MergeAll at `ledger` — a governed hop fuses threads downstream.");
     let merged = build_and_run(Some(TransferPolicy::MergeAll));

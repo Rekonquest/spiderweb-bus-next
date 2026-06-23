@@ -178,8 +178,15 @@ fn main() {
     let html_path = std::env::temp_dir().join("spiderweb-weave.html");
     std::fs::write(&html_path, &html).expect("write viewer");
 
-    println!("\n  3D scene:   {} ({} bytes)", json_path.display(), scene.len());
-    println!("  3D viewer:  {} — open it and drag to rotate", html_path.display());
+    println!(
+        "\n  3D scene:   {} ({} bytes)",
+        json_path.display(),
+        scene.len()
+    );
+    println!(
+        "  3D viewer:  {} — open it and drag to rotate",
+        html_path.display()
+    );
     println!(
         "\n  (coordinates + distance + attenuation only — all nodes are in RAM, timing unchanged)"
     );

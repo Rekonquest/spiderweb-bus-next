@@ -100,7 +100,11 @@ fn highway_preserves_each_thread_through_lanes() {
     // Every item also actually arrived at the sink (no loss).
     let mut values = got.lock().unwrap().clone();
     values.sort_unstable();
-    assert_eq!(values, (0..N).collect::<Vec<_>>(), "all items should arrive");
+    assert_eq!(
+        values,
+        (0..N).collect::<Vec<_>>(),
+        "all items should arrive"
+    );
 
     let snap = bus.fabric_snapshot();
     let full_path = vec!["source".to_string(), "hw".to_string(), "sink".to_string()];

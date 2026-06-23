@@ -27,16 +27,25 @@ struct CrashCounter {
 struct CrashThenOk(CrashCounter);
 
 impl Strand for CrashThenOk {
-    fn name(&self) -> &str { "crash-then-ok" }
-    fn inputs(&self) -> &[Socket] { &[] }
-    fn outputs(&self) -> &[Socket] { &[] }
+    fn name(&self) -> &str {
+        "crash-then-ok"
+    }
+    fn inputs(&self) -> &[Socket] {
+        &[]
+    }
+    fn outputs(&self) -> &[Socket] {
+        &[]
+    }
     fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
         self.0.ticks.fetch_add(1, Ordering::SeqCst);
         let left = self.0.failures_left.load(Ordering::SeqCst);
         if left > 0 {
             self.0.failures_left.fetch_sub(1, Ordering::SeqCst);
             bus.log(&format!("intentional crash ({} left)", left - 1));
-            return Err(StrandError::Crashed(format!("intentional ({} left)", left - 1)));
+            return Err(StrandError::Crashed(format!(
+                "intentional ({} left)",
+                left - 1
+            )));
         }
         bus.log("ok, no more failures");
         bus.sleep(Duration::from_millis(100));
@@ -51,7 +60,10 @@ impl Strand for CrashThenOk {
 fn spider_restarts_then_succeeds() {
     let ticks = Arc::new(AtomicU32::new(0));
     let failures_left = Arc::new(AtomicU32::new(2));
-    let counter = CrashCounter { ticks: ticks.clone(), failures_left: failures_left.clone() };
+    let counter = CrashCounter {
+        ticks: ticks.clone(),
+        failures_left: failures_left.clone(),
+    };
     let counter_for_factory = counter.clone();
 
     let mut bus = Bus::open();
@@ -69,12 +81,20 @@ fn spider_restarts_then_succeeds() {
     );
 }
 
-struct AlwaysCrash { ticks: Arc<AtomicU32> }
+struct AlwaysCrash {
+    ticks: Arc<AtomicU32>,
+}
 
 impl Strand for AlwaysCrash {
-    fn name(&self) -> &str { "always-crash" }
-    fn inputs(&self) -> &[Socket] { &[] }
-    fn outputs(&self) -> &[Socket] { &[] }
+    fn name(&self) -> &str {
+        "always-crash"
+    }
+    fn inputs(&self) -> &[Socket] {
+        &[]
+    }
+    fn outputs(&self) -> &[Socket] {
+        &[]
+    }
     fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
         self.ticks.fetch_add(1, Ordering::SeqCst);
         bus.log("always crash");
@@ -92,7 +112,9 @@ fn spider_quarantines_after_max_crashes() {
 
     let mut bus = Bus::open();
     bus.register_spec(StrandSpec::new("always-crash", move || {
-        Box::new(AlwaysCrash { ticks: ticks_factory.clone() })
+        Box::new(AlwaysCrash {
+            ticks: ticks_factory.clone(),
+        })
     }));
     bus.register_spider(StrandSpec::new("spider", || Box::new(Spider::new())));
     bus.run_until(Some(Duration::from_millis(800)));
@@ -170,12 +192,20 @@ fn run_winds_down_without_spider_after_crash() {
     );
 }
 
-struct LiveCrasher { count: Arc<AtomicU32> }
+struct LiveCrasher {
+    count: Arc<AtomicU32>,
+}
 
 impl Strand for LiveCrasher {
-    fn name(&self) -> &str { "live-crasher" }
-    fn inputs(&self) -> &[Socket] { &[] }
-    fn outputs(&self) -> &[Socket] { &[] }
+    fn name(&self) -> &str {
+        "live-crasher"
+    }
+    fn inputs(&self) -> &[Socket] {
+        &[]
+    }
+    fn outputs(&self) -> &[Socket] {
+        &[]
+    }
     fn run(&mut self, _bus: &mut BusHandle) -> Result<(), StrandError> {
         self.count.fetch_add(1, Ordering::SeqCst);
         Err(StrandError::Crashed("live strand crash".into()))
@@ -206,9 +236,15 @@ fn live_strand_crash_is_not_restarted() {
 struct LiveQuiet;
 
 impl Strand for LiveQuiet {
-    fn name(&self) -> &str { "live-quiet" }
-    fn inputs(&self) -> &[Socket] { &[] }
-    fn outputs(&self) -> &[Socket] { &[] }
+    fn name(&self) -> &str {
+        "live-quiet"
+    }
+    fn inputs(&self) -> &[Socket] {
+        &[]
+    }
+    fn outputs(&self) -> &[Socket] {
+        &[]
+    }
     fn run(&mut self, _bus: &mut BusHandle) -> Result<(), StrandError> {
         Ok(())
     }
@@ -835,7 +871,9 @@ fn shutdown_joins_a_parked_crashed_slot_without_hanging() {
             ticks: crash_factory.clone(),
         })
     }));
-    bus.register_spider(StrandSpec::new("passive-spider", || Box::new(PassiveSpider)));
+    bus.register_spider(StrandSpec::new("passive-spider", || {
+        Box::new(PassiveSpider)
+    }));
 
     let start = std::time::Instant::now();
     bus.run_until(Some(Duration::from_millis(200)));

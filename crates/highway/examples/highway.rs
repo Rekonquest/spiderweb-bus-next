@@ -52,7 +52,9 @@ impl Strand for Dispatcher {
         if self.sent {
             return Err(StrandError::Detach);
         }
-        bus.log(&format!("dispatching {PARCELS} parcels onto the road (burst)"));
+        bus.log(&format!(
+            "dispatching {PARCELS} parcels onto the road (burst)"
+        ));
         for i in 0..PARCELS {
             bus.publish("road.parcel", Parcel(i))?;
         }
@@ -90,9 +92,7 @@ impl Strand for Depot {
             let elapsed = self.start.elapsed();
             let serial = WORK * PARCELS as u32;
             bus.log("──────────────────────────────────────────");
-            bus.log(&format!(
-                "all {PARCELS} parcels delivered in {elapsed:?}"
-            ));
+            bus.log(&format!("all {PARCELS} parcels delivered in {elapsed:?}"));
             bus.log(&format!(
                 "serial would be ~{serial:?} ({PARCELS} × {WORK:?}); {LANES} lanes ≈ {:.1}× faster",
                 serial.as_secs_f64() / elapsed.as_secs_f64()

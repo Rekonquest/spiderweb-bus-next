@@ -12,11 +12,11 @@
 //!   behind and watch the difference in arrival rate.
 //! - v2 will add explicit inbox capacity + drop events.
 
-use spiderweb::Bus;
-use cap_source::CapSource;
 use cap_sink::CapSink;
 use cap_slow_sink::CapSlowSink;
+use cap_source::CapSource;
 use spider::Spider;
+use spiderweb::Bus;
 use std::time::Duration;
 
 fn main() {

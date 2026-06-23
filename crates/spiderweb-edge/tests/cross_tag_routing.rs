@@ -28,7 +28,10 @@ impl Strand for Source {
         &[]
     }
     fn outputs(&self) -> &[Socket] {
-        const SS: [Socket; 2] = [Socket::new::<String>("wire.note"), Socket::new::<String>("wire.cmd")];
+        const SS: [Socket; 2] = [
+            Socket::new::<String>("wire.note"),
+            Socket::new::<String>("wire.cmd"),
+        ];
         &SS
     }
     fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
@@ -103,8 +106,26 @@ fn distinct_tags_route_to_distinct_sockets_across_the_wire() {
 
     let got = collected.lock().unwrap();
     let on = |sock: &str, val: &str| got.iter().filter(|(s, v)| s == sock && v == val).count();
-    assert!(on("cmd.in", "CMD-payload") > 0, "cmd tag must transmit to cmd.in, got {:?}", *got);
-    assert!(on("note.in", "NOTE-payload") > 0, "note tag must transmit to note.in, got {:?}", *got);
-    assert_eq!(on("note.in", "CMD-payload"), 0, "CMD must NOT be mis-tagged onto note.in, got {:?}", *got);
-    assert_eq!(on("cmd.in", "NOTE-payload"), 0, "NOTE must NOT be mis-tagged onto cmd.in, got {:?}", *got);
+    assert!(
+        on("cmd.in", "CMD-payload") > 0,
+        "cmd tag must transmit to cmd.in, got {:?}",
+        *got
+    );
+    assert!(
+        on("note.in", "NOTE-payload") > 0,
+        "note tag must transmit to note.in, got {:?}",
+        *got
+    );
+    assert_eq!(
+        on("note.in", "CMD-payload"),
+        0,
+        "CMD must NOT be mis-tagged onto note.in, got {:?}",
+        *got
+    );
+    assert_eq!(
+        on("cmd.in", "NOTE-payload"),
+        0,
+        "NOTE must NOT be mis-tagged onto cmd.in, got {:?}",
+        *got
+    );
 }

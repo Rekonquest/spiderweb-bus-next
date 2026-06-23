@@ -8,11 +8,11 @@
 //! times); the spider logs each restart. cap-crasher-B ticks 5 times
 //! then crashes the same way but with a higher count.
 
-use spiderweb::{Bus, StrandSpec};
-use cap_source::CapSource;
-use cap_sink::CapSink;
 use cap_crasher::CapCrasher;
+use cap_sink::CapSink;
+use cap_source::CapSource;
 use spider::Spider;
+use spiderweb::{Bus, StrandSpec};
 use std::time::Duration;
 
 fn main() {
