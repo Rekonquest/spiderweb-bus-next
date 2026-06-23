@@ -158,10 +158,21 @@ misbehaving, and must shut down cleanly.
   push/PR, with build cache. Workspace `fmt`-normalized so the gate is green.
 
 ## Phase 5 — Packaging & docs (shippable)
-- [ ] **Rustdoc complete**; per-crate README; a quickstart example.
-- [ ] **Versioning + CHANGELOG**; semver discipline.
-- [ ] **Consolidate**: decide baseline-retire vs fork-merge-back; one line.
-- [ ] **Release checklist**: license headers, `cargo publish --dry-run` clean.
+- [x] **Docs + quickstart.** Top-level `README.md` (what it is, runnable
+  quickstart, architecture-in-a-breath, crate map, solid-vs-honest-gaps, build/
+  test, MSRV). Every crate carries rich `//!` module docs (rustdoc). Demos are
+  runnable examples (`cargo run -p <crate> --example <name>`).
+- [x] **Versioning + CHANGELOG.** `CHANGELOG.md` (Keep-a-Changelog style),
+  workspace pinned at `0.1.0`, semver-from-1.0 stated.
+- [x] **Consolidate.** Decision recorded: the fork **`Spiderweb-Bus-Next` is the
+  canonical product line** (superset = in-process core + edge + heat); the
+  baseline `Spiderweb Bus` is the historical stable point. No merge-back needed.
+- [x] **Release checklist.** `LICENSE-MIT` + `LICENSE-APACHE` added (dual,
+  matching the manifest). `cargo publish --dry-run -p spiderweb` **packages +
+  verifies clean** (builds in isolation, 9 files). Honest finding: the bare name
+  `spiderweb` is **already taken on crates.io**, so the repo is deliverable as a
+  git dependency as-is, and a crates.io publish needs a one-line rename (e.g.
+  `spiderweb-bus`). Adding a `repository` URL clears the last manifest warning.
 
 ---
 
