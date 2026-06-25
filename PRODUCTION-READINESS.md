@@ -60,6 +60,33 @@ checked the *baseline* repo at `159ddca` instead of the fork; the four area
 auditors all read the fork via absolute paths and verified it. The verdict was a
 wrong-directory artifact, not a real gap.)
 
+### External lanes (2026-06-25)
+
+`spiderweb-lanes` reaches the bus past one process. A unifying `Lane` contract
+(`install() -> LaneParts { strands, guard, bound }`, `bus.add_lane(...)`)
+generalizes the edge sender/listener; six lanes built lane-by-lane (branch →
+build → test → clippy → fmt → commit), each with a real-socket or pure test:
+
+- **tcp** — re-expresses the unchanged edge transport as the reference Lane
+  (`lane_trait_round_trips_over_tcp_loopback`).
+- **http** — std-only HTTP/1.1 server + client; `http_round_trips_over_a_real_socket`.
+- **api** — bus-native request/reply RPC + JSON-over-HTTP bridge;
+  `rpc_round_trips_on_one_bus`, `api_over_http_round_trips`.
+- **mesh** — N-peer P2P, per-origin exactly-once + loop suppression;
+  `triangle_delivers_each_message_exactly_once`. (Fixed a real bug found here:
+  the reader must thread-per-connection, else a node services only its first
+  inbound peer — fatal for a mesh.)
+- **nat** — rendezvous-relay traversal (`relayd`); `message_federates_through_the_relay`
+  + room-msg fuzz.
+- **ssh** — bus over a composed system-`ssh` `-L`/`-R` tunnel (encryption with
+  zero crypto deps); exact-argv tests + `ssh`-absent → typed error.
+
+std-only except the SSH lane's `std::process` of `ssh`. Demos `http_api`
+(curl JSON-RPC) + `p2p_mesh`; `webctl lanes`. Workspace green: 156 tests across
+41 binaries, clippy `-D warnings`, fmt. Honest gaps: HTTP/API/mesh/NAT are
+plaintext (use the SSH lane to encrypt); the relay is a SPOF; HTTP is
+`Connection: close` (no keep-alive); no end-to-end ACK beyond the edge ring.
+
 ---
 
 ## Phase 1 — Robustness (the bus must not fall over)
