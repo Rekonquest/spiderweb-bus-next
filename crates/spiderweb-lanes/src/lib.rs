@@ -32,12 +32,12 @@ pub mod api;
 pub mod http;
 pub mod mesh;
 pub mod nat;
+pub mod ssh;
 
 pub use api::{ApiCaller, ApiClient, ApiError, ApiHttpBridge, ApiServer, Request, Response};
 pub use http::HttpLane;
 pub use lane::{Bridge, BusLanes, Lane, LaneError, LaneParts, LaneStrand};
 pub use mesh::{Mesh, MeshNode, PeerHandle};
 pub use nat::{NatLane, NatRelayListener, NatRelaySender, Relay, RoomAddr};
+pub use ssh::{Direction, SshForward, SshLane, SshLaneError, SshTunnel};
 pub use tcp::TcpLane;
-
-// Remaining lane module (ssh) lands in the next commit.

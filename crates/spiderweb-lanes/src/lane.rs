@@ -225,6 +225,54 @@ mod tests {
         );
     }
 
+    /// A lane that owns an external resource hands a `guard` back through
+    /// `add_lane` (the seam the SSH lane uses to keep its `ssh` child alive).
+    #[test]
+    fn add_lane_returns_a_guard_for_resource_owning_lanes() {
+        struct GuardedLane {
+            ran: Arc<AtomicBool>,
+            bridges: Vec<Bridge>,
+        }
+        impl Lane for GuardedLane {
+            fn kind(&self) -> &'static str {
+                "guarded"
+            }
+            fn bridges(&self) -> &[Bridge] {
+                &self.bridges
+            }
+            fn install(&self) -> Result<LaneParts, LaneError> {
+                Ok(LaneParts {
+                    strands: vec![(
+                        "out".into(),
+                        Box::new(Pinger {
+                            ran: self.ran.clone(),
+                        }),
+                    )],
+                    // A stand-in for SSH's SshTunnel: dropping it would tear the
+                    // external resource down.
+                    guard: Some(Box::new(String::from("external-resource-handle"))),
+                    bound: Some("127.0.0.1:4242".parse().unwrap()),
+                })
+            }
+        }
+
+        let lane = GuardedLane {
+            ran: Arc::new(AtomicBool::new(false)),
+            bridges: Vec::new(),
+        };
+        let mut bus = Bus::open();
+        let (bound, guard) = bus.add_lane("g", &lane).expect("install");
+        assert_eq!(
+            bound.map(|a| a.to_string()),
+            Some("127.0.0.1:4242".to_string())
+        );
+        let held = guard.expect("a resource-owning lane returns a guard");
+        assert!(
+            held.downcast_ref::<String>().is_some(),
+            "the guard is handed back to the caller to keep alive"
+        );
+    }
+
     #[test]
     fn lane_describes_its_kind_and_bridges() {
         let lane = OneStrandLane {
