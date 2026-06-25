@@ -220,13 +220,12 @@ impl Strand for MeshNode {
         let mut book = self.peers.lock().unwrap_or_else(|p| p.into_inner());
         for (addr, stream_opt) in book.peers.iter_mut() {
             let just_connected = if stream_opt.is_none() {
-                match TcpStream::connect(addr.as_str()) {
-                    Ok(s) => {
-                        let _ = s.set_write_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)));
+                match dial(addr) {
+                    Some(s) => {
                         *stream_opt = Some(s);
                         true
                     }
-                    Err(_) => continue, // dead peer; retry next tick.
+                    None => continue, // dead peer; retry next tick.
                 }
             } else {
                 false
@@ -291,6 +290,16 @@ impl Drop for MeshNode {
     }
 }
 
+/// Connect to a peer with bounded blocking, so a slow/dead peer never stalls a
+/// tick for the OS default connect timeout: resolve, connect with a short
+/// timeout, set a write timeout.
+fn dial(addr: &str) -> Option<TcpStream> {
+    let sa = addr.to_socket_addrs().ok()?.next()?;
+    let s = TcpStream::connect_timeout(&sa, Duration::from_secs(1)).ok()?;
+    let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
+    Some(s)
+}
+
 /// The dial-out set: `addr -> lazily-connected stream`.
 struct PeerBook {
     peers: Vec<(String, Option<TcpStream>)>,
@@ -323,7 +332,12 @@ impl PeerHandle {
     }
 }
 
-/// Accept many peers in sequence and stream every peer's frames into `tx`.
+/// Accept peers and read EACH on its own thread, so a node receives from ALL
+/// its inbound peers concurrently. (A single reader that read one connection to
+/// EOF before accepting the next — the edge point-to-point pattern — would only
+/// ever service the first peer that connected, starving the rest: fatal for a
+/// mesh.) The per-connection threads are daemon-like: they exit on EOF (peer
+/// close at shutdown), on the read timeout, or when the channel is gone.
 fn reader_loop(listener: TcpListener, tx: SyncSender<Frame>, shutdown: Arc<AtomicBool>) {
     for conn in listener.incoming() {
         if shutdown.load(Ordering::Acquire) {
@@ -333,12 +347,16 @@ fn reader_loop(listener: TcpListener, tx: SyncSender<Frame>, shutdown: Arc<Atomi
             Ok(s) => s,
             Err(_) => continue,
         };
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)));
-        while let Ok(frame) = read_frame(&mut stream) {
-            if shutdown.load(Ordering::Acquire) || tx.send(frame).is_err() {
-                return;
+        let tx = tx.clone();
+        let sd = shutdown.clone();
+        thread::spawn(move || {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)));
+            while let Ok(frame) = read_frame(&mut stream) {
+                if sd.load(Ordering::Acquire) || tx.send(frame).is_err() {
+                    return;
+                }
             }
-        }
+        });
     }
 }
 

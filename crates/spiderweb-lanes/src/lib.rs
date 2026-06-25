@@ -31,11 +31,13 @@ pub mod tcp;
 pub mod api;
 pub mod http;
 pub mod mesh;
+pub mod nat;
 
 pub use api::{ApiCaller, ApiClient, ApiError, ApiHttpBridge, ApiServer, Request, Response};
 pub use http::HttpLane;
 pub use lane::{Bridge, BusLanes, Lane, LaneError, LaneParts, LaneStrand};
 pub use mesh::{Mesh, MeshNode, PeerHandle};
+pub use nat::{NatLane, NatRelayListener, NatRelaySender, Relay, RoomAddr};
 pub use tcp::TcpLane;
 
-// Remaining lane modules (nat, ssh) land in subsequent commits.
+// Remaining lane module (ssh) lands in the next commit.
