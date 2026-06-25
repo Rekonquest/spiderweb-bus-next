@@ -26,8 +26,10 @@
 pub mod lane;
 pub mod tcp;
 
+pub mod api;
 pub mod http;
 
+pub use api::{ApiCaller, ApiClient, ApiError, ApiHttpBridge, ApiServer, Request, Response};
 pub use http::HttpLane;
 pub use lane::{Bridge, BusLanes, Lane, LaneError, LaneParts, LaneStrand};
 pub use tcp::TcpLane;
