@@ -244,6 +244,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "spiderweb-lanes"
+version = "0.1.0"
+dependencies = [
+ "highway",
+ "spiderweb",
+ "spiderweb-edge",
+]
+
+[[package]]
 name = "spiderweb-registry"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,24 @@
+[package]
+name = "spiderweb-lanes"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# External protocol lanes: HTTP, API/RPC, P2P mesh, NAT relay, SSH tunnel.
+# Each lane is an on-ramp/off-ramp between the in-process bus and an outside-
+# world transport — an ingress strand (external -> decode -> publish) and an
+# egress strand (subscribe -> encode -> send), generalizing the `spiderweb-edge`
+# sender/listener pattern. The KERNEL stays std-only / zero-dep / forbid-unsafe;
+# these lanes are companion strands. std-only by default; the SSH lane composes
+# with the system `ssh` binary (crypto is a real wall for a zero-dep crate) via
+# `std::process` rather than reimplementing SSH.
+[dependencies]
+spiderweb = { workspace = true }
+spiderweb-edge = { workspace = true }
+# The HTTP client lane runs blocking round-trips on a Highway worker pool
+# (dumb-primitive reuse) so a tick never blocks.
+highway = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

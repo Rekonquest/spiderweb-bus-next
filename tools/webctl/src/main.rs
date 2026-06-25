@@ -95,6 +95,37 @@ const DEMOS: &[Demo] = &[
         description: "v1.3: the web in 3D — ground/highway/spider at z=0/1/2; a vibration felt strongly near, faintly far; exports a 3D scene.",
         estimated_duration: Duration::from_secs(3),
     },
+    Demo {
+        name: "http-api",
+        package: "spiderweb-lanes",
+        example: "http_api",
+        description: "lanes: a bus answers JSON-RPC over HTTP on :8787 — curl it (add/echo). Shows the HTTP + API lanes.",
+        estimated_duration: Duration::from_secs(30),
+    },
+    Demo {
+        name: "p2p-mesh",
+        package: "spiderweb-lanes",
+        example: "p2p_mesh",
+        description: "lanes: 3 in-process buses form a triangle; A broadcasts, B & C receive each message exactly once (per-origin dedup).",
+        estimated_duration: Duration::from_secs(2),
+    },
+];
+
+/// The external protocol lanes the `spiderweb-lanes` crate provides — each an
+/// on-ramp/off-ramp between the in-process bus and an outside-world transport.
+const LANES: &[(&str, &str)] = &[
+    ("tcp", "point-to-point edge transport (the reference Lane)"),
+    ("http", "std-only HTTP/1.1 server + client"),
+    (
+        "api",
+        "typed request/reply RPC over the bus, exposed over HTTP (JSON)",
+    ),
+    ("mesh", "N-peer P2P mesh with per-origin loop suppression"),
+    ("nat", "NAT traversal via a rendezvous relay (run `relayd`)"),
+    (
+        "ssh",
+        "bus over a composed system-ssh port-forward (encrypted, zero crypto deps)",
+    ),
 ];
 
 fn main() {
@@ -116,6 +147,7 @@ fn main() {
         }
         "top" => run_top(),
         "topology" => show_topology(),
+        "lanes" => list_lanes(),
         "version" | "--version" | "-v" => {
             println!("webctl {}", VERSION);
             println!("spiderweb v1.3");
@@ -142,6 +174,16 @@ fn list_demos() {
         );
     }
     println!("\nRun with: webctl run <name>");
+}
+
+fn list_lanes() {
+    println!("🛣️  spiderweb external lanes (spiderweb-lanes):\n");
+    for (kind, desc) in LANES {
+        println!("  {kind:<5} — {desc}");
+    }
+    println!("\nEach lane is an on-ramp/off-ramp between the bus and an outside-world");
+    println!("transport. See `webctl run http-api` / `webctl run p2p-mesh`.");
+    println!("NAT relay server: cargo run -p spiderweb-lanes --bin relayd -- 0.0.0.0:9000");
 }
 
 fn run_demo(name: &str) {
@@ -213,6 +255,7 @@ fn print_help() {
     println!("COMMANDS:");
     println!("    list           List available demos");
     println!("    run <name>     Run a demo");
+    println!("    lanes          List the external protocol lanes (http/api/mesh/nat/ssh)");
     println!("    top            Live dashboard of a running bus (BusStats)");
     println!("    topology       Show the static topology reference");
     println!("    version        Show the version");

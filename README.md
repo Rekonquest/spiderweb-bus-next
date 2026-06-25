@@ -88,10 +88,33 @@ kernel and the architecture notes throughout.
 | **`preload`** | Background read-ahead source; emits starvation vibrations. |
 | **`spiderweb-registry`** | Self-registration (`advertise!`) + `bus.auto_connect()` (via the `BusAutoConnect` extension trait; quarantines the one `inventory` dep). |
 | **`spiderweb-edge`** | Cross-process / P2P transport over TCP (std-only). Reliable framing; **trusted-network MVP**. |
+| **`spiderweb-lanes`** | External protocol **lanes** — HTTP, JSON-RPC API, P2P mesh, NAT relay, SSH tunnel — as on-ramps/off-ramps to the outside world. std-only (the SSH lane composes the system `ssh`). |
 | **`spiderweb-heat`** | Graph heat-kernel attenuation (`H_t = exp(−tL)`) — topology-aware vibration decay. |
 | **`spiderweb-viz`** | Export the fabric as a 3D scene (JSON / interactive HTML); `render_top` dashboard. |
-| **`tools/webctl`** | CLI: `list`, `run <demo>`, `top` (live `BusStats` dashboard), `topology`. |
+| **`tools/webctl`** | CLI: `list`, `run <demo>`, `lanes`, `top` (live `BusStats` dashboard), `topology`. |
 | **`cap-*`** | Demo strands (source/sink/slow-sink/crasher/image pipeline). |
+
+## Lanes — talking to the outside world
+
+`spiderweb-lanes` makes the bus reach past one process. Every lane is the same
+shape: an **ingress** strand (external → decode → publish) + an **egress** strand
+(subscribe → encode → send), generalizing the edge sender/listener. Install one
+with `bus.add_lane("name", &lane)`.
+
+| Lane | What it does |
+|---|---|
+| **`tcp`** | The reference lane — re-expresses the unchanged `spiderweb-edge` transport. |
+| **`http`** | std-only HTTP/1.1 server (requests → bus, bus → responses) + client (bus → outbound calls → bus, on a worker pool). |
+| **`api`** | Typed request/reply RPC over the bus (`ApiServer`/`ApiCaller`), exposed over HTTP as JSON (`POST /api {"method","params"}`). |
+| **`mesh`** | N-peer P2P: each node originates + forwards; per-origin dedup delivers each message everywhere exactly once and suppresses loops. |
+| **`nat`** | NAT traversal by **rendezvous relay** — both peers dial out to a relay (`relayd`) and federate by room. No inbound port needed. |
+| **`ssh`** | Bus over a composed `ssh -L`/`-R` port-forward — encrypted + authenticated with **zero crypto deps** (drives the system `ssh`). |
+
+```sh
+cargo run -p spiderweb-lanes --example http_api    # curl JSON-RPC at :8787
+cargo run -p spiderweb-lanes --example p2p_mesh     # 3-node mesh, exactly-once
+cargo run -p spiderweb-lanes --bin relayd -- 0.0.0.0:9000   # the NAT relay
+```
 
 ## What's solid vs. honest gaps
 
@@ -107,7 +130,11 @@ no per-frame MAC (auth), no TLS yet (this is where the zero-dep story ends and
 crypto deps begin). Edge reliability is a bounded resend ring (recovers up to
 `RING_CAP` frames of disconnect, with session IDs handling sender restarts);
 unbounded/no-head-of-line-blocking reliability (RLNC tier-2) and cross-machine
-causality (ITC) are the remaining tiers.
+causality (ITC) are the remaining tiers. The HTTP/API/mesh/NAT lanes are likewise
+plaintext (trusted network); the **SSH lane** is how you get encryption today —
+it tunnels any of them through the system `ssh` with zero crypto deps. The NAT
+relay is a coordination convenience (single point of failure, double bandwidth),
+not a trust boundary.
 
 ## Build & test
 

@@ -25,6 +25,13 @@ layer is an honest trusted-network MVP. See
   bounded reliable delivery (session + seq + resend ring + dedup), including
   **session-ID restart recovery** (a restarted sender is recovered, not blacked
   out) and clean `EdgeListener::Drop` teardown.
+- **`spiderweb-lanes`**: external protocol **lanes** as on-ramps/off-ramps —
+  a unifying `Lane` contract (`install() -> LaneParts`) plus: **HTTP** (std-only
+  HTTP/1.1 server + client), **API** (typed request/reply RPC over the bus,
+  exposed over HTTP as JSON), **P2P mesh** (N-peer, per-origin exactly-once +
+  loop suppression), **NAT relay** (`relayd` rendezvous, traverses NAT by
+  dialing out), and **SSH** (bus over a composed `ssh -L`/`-R` tunnel — encrypted
+  with zero crypto deps). std-only except the SSH lane's `std::process` of `ssh`.
 - **`spiderweb-heat`**: graph heat-kernel attenuation (`H_t = exp(−tL)`).
 
 ### Hardened — production readiness (Phases 1–2)
