@@ -247,6 +247,7 @@ dependencies = [
 name = "spiderweb-lanes"
 version = "0.1.0"
 dependencies = [
+ "highway",
  "spiderweb",
  "spiderweb-edge",
 ]

@@ -28,6 +28,7 @@ pub mod tcp;
 
 pub mod http;
 
+pub use http::HttpLane;
 pub use lane::{Bridge, BusLanes, Lane, LaneError, LaneParts, LaneStrand};
 pub use tcp::TcpLane;
 

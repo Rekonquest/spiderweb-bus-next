@@ -15,12 +15,13 @@ pub const MAX_HEAD: usize = 64 * 1024;
 /// Cap a body (and our own responses) so a bogus `Content-Length` can't OOM us.
 pub const MAX_BODY: usize = 16 * 1024 * 1024;
 
-/// An inbound HTTP request, published onto the bus by the server lane. `id` is
-/// a per-server correlation id; a handler echoes it back in [`HttpResponse`] so
-/// the server can route the reply to the right still-open connection.
+/// An inbound HTTP request, published onto the bus by the server lane.
+/// `reply_id` is a per-server correlation token; a handler echoes it back in
+/// [`HttpResponse`] so the server can route the reply to the right still-open
+/// connection.
 #[derive(Clone, Debug)]
 pub struct HttpRequest {
-    pub id: u64,
+    pub reply_id: u64,
     pub method: String,
     pub path: String,
     pub headers: Vec<(String, String)>,
@@ -28,21 +29,21 @@ pub struct HttpRequest {
 }
 
 /// A handler's reply, published onto the bus; the server writes it back to the
-/// connection whose request carried the same `id`.
+/// connection whose request carried the same `reply_id`.
 #[derive(Clone, Debug)]
 pub struct HttpResponse {
-    pub id: u64,
+    pub reply_id: u64,
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
 
 impl HttpResponse {
-    /// Convenience: a `text/plain` 200 reply correlated to `id`.
-    pub fn text(id: u64, body: impl Into<String>) -> Self {
+    /// Convenience: a `text/plain` 200 reply correlated to `reply_id`.
+    pub fn text(reply_id: u64, body: impl Into<String>) -> Self {
         let body = body.into().into_bytes();
         HttpResponse {
-            id,
+            reply_id,
             status: 200,
             headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
             body,
@@ -50,9 +51,9 @@ impl HttpResponse {
     }
 
     /// Convenience: a status-only reply (empty body), e.g. 404 / 503.
-    pub fn status(id: u64, status: u16) -> Self {
+    pub fn status(reply_id: u64, status: u16) -> Self {
         HttpResponse {
-            id,
+            reply_id,
             status,
             headers: Vec::new(),
             body: Vec::new(),
@@ -70,11 +71,35 @@ impl HttpRequest {
     }
 }
 
+/// An outbound HTTP request the client lane should perform, published onto the
+/// bus by some strand. `id` correlates it to its [`HttpResult`].
+#[derive(Clone, Debug)]
+pub struct HttpCall {
+    pub id: u64,
+    pub method: String,
+    /// `http://host[:port]/path` — plaintext only on the std path (no TLS).
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// The outcome of an [`HttpCall`], published back onto the bus. `error` is
+/// `Some` when the request never completed (connect/parse/timeout); `status`/
+/// `body` are then defaults.
+#[derive(Clone, Debug)]
+pub struct HttpResult {
+    pub id: u64,
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    pub error: Option<String>,
+}
+
 /// Parse one HTTP/1.1 request from `r`. `id` is stamped onto the result for
 /// correlation. Returns `Err` (which the caller turns into a dropped/!closed
 /// connection) on malformed input, an over-cap head/body, or EOF. Never panics
 /// and never allocates a body larger than `MAX_BODY`.
-pub fn parse_request<R: Read>(r: R, id: u64) -> io::Result<HttpRequest> {
+pub fn parse_request<R: Read>(r: R, reply_id: u64) -> io::Result<HttpRequest> {
     let mut reader = BufReader::new(r);
 
     // --- request line + headers: read lines until a blank line, bounded ---
@@ -120,7 +145,7 @@ pub fn parse_request<R: Read>(r: R, id: u64) -> io::Result<HttpRequest> {
     reader.read_exact(&mut body)?;
 
     Ok(HttpRequest {
-        id,
+        reply_id,
         method,
         path,
         headers,
@@ -189,7 +214,7 @@ mod tests {
     fn parses_a_get_with_no_body() {
         let raw = b"GET /hello?x=1 HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\n\r\n";
         let req = parse_request(&raw[..], 7).expect("parse");
-        assert_eq!(req.id, 7);
+        assert_eq!(req.reply_id, 7);
         assert_eq!(req.method, "GET");
         assert_eq!(req.path, "/hello?x=1");
         assert_eq!(req.header("host"), Some("localhost"));

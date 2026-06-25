@@ -16,6 +16,9 @@ rust-version.workspace = true
 [dependencies]
 spiderweb = { workspace = true }
 spiderweb-edge = { workspace = true }
+# The HTTP client lane runs blocking round-trips on a Highway worker pool
+# (dumb-primitive reuse) so a tick never blocks.
+highway = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"
