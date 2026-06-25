@@ -23,16 +23,19 @@
 
 #![forbid(unsafe_code)]
 
+mod frame;
+
 pub mod lane;
 pub mod tcp;
 
 pub mod api;
 pub mod http;
+pub mod mesh;
 
 pub use api::{ApiCaller, ApiClient, ApiError, ApiHttpBridge, ApiServer, Request, Response};
 pub use http::HttpLane;
 pub use lane::{Bridge, BusLanes, Lane, LaneError, LaneParts, LaneStrand};
+pub use mesh::{Mesh, MeshNode, PeerHandle};
 pub use tcp::TcpLane;
 
-// More lane modules (api, mesh, nat, ssh) land in subsequent commits, informed
-// by the lane-design synthesis.
+// Remaining lane modules (nat, ssh) land in subsequent commits.
