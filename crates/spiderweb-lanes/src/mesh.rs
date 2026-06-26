@@ -226,15 +226,21 @@ impl Strand for MeshNode {
         if bus.is_shutting_down() {
             return Ok(());
         }
-        // Snapshot the peer list OUT of the lock so blocking I/O (dial /
-        // write_frame) never holds it: holding the lock across a slow or
-        // unreachable peer would stall every PeerHandle AND wedge this tick.
+        // Take the streams OUT for unlocked I/O (dial/write must never hold the
+        // lock — that would stall every PeerHandle and, with no per-tick
+        // watchdog, wedge this tick) but LEAVE the addr entries in the book, so
+        // a concurrent PeerHandle add/remove during the I/O window is honored:
+        // a removed addr won't be found on restore (its stream is dropped); an
+        // added addr stays (dialed next tick).
         let origin = self.origin;
-        let mut peers: Vec<(String, Option<TcpStream>)> = {
+        let mut work: Vec<(String, Option<TcpStream>)> = {
             let mut book = self.peers.lock().unwrap_or_else(|p| p.into_inner());
-            std::mem::take(&mut book.peers)
+            book.peers
+                .iter_mut()
+                .map(|(addr, stream)| (addr.clone(), stream.take()))
+                .collect()
         };
-        for (addr, stream_opt) in peers.iter_mut() {
+        for (addr, stream_opt) in work.iter_mut() {
             let just_connected = if stream_opt.is_none() {
                 match dial(addr) {
                     Some(s) => {
@@ -278,16 +284,16 @@ impl Strand for MeshNode {
                 *stream_opt = None; // drop this one peer; reconnect next tick.
             }
         }
-        // Restore the snapshot, keeping any peers added via PeerHandle during I/O.
+        // Restore the streams to the addrs still present; a peer removed during
+        // the I/O window is simply not found, so its stream is dropped (closed)
+        // — the removal is honored. Added peers keep their `None` stream.
         {
             let mut book = self.peers.lock().unwrap_or_else(|p| p.into_inner());
-            let added = std::mem::take(&mut book.peers);
-            for (addr, stream) in added {
-                if !peers.iter().any(|(a, _)| *a == addr) {
-                    peers.push((addr, stream));
+            for (addr, stream) in work {
+                if let Some(slot) = book.peers.iter_mut().find(|(a, _)| *a == addr) {
+                    slot.1 = stream;
                 }
             }
-            book.peers = peers;
         }
 
         bus.sleep(Duration::from_millis(5));
