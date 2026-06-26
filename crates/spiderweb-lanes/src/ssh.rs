@@ -138,6 +138,9 @@ impl SshForward {
             a.push("-o".into());
             a.push(o.clone());
         }
+        // `--` terminates option parsing so a host/user beginning with `-` can't
+        // be smuggled in as an ssh option (e.g. `-oProxyCommand=…`).
+        a.push("--".into());
         a.push(match &self.user {
             Some(u) => format!("{u}@{}", self.host),
             None => self.host.clone(),
@@ -199,6 +202,15 @@ pub struct SshTunnel {
 impl SshTunnel {
     /// Build argv from `fwd`, spawn `ssh -N`, and block until ready (the
     /// forwarded local port accepts a connection, for `-L`) or the deadline.
+    ///
+    /// Readiness contract differs by direction. For `-L` it is strong: the local
+    /// bind port is probed until it accepts. For `-R` there is no local port to
+    /// probe, so readiness is "the child is still alive at the deadline" — a
+    /// weaker signal that leans on `ExitOnForwardFailure=yes` (in the argv) to
+    /// make ssh *exit* if the remote bind fails, which is caught here as
+    /// `SshExited`. A remote forward that ssh reports as succeeded but that is
+    /// unreachable at the app layer is not detected; verify with an app-level
+    /// handshake if you need certainty.
     pub fn open(fwd: SshForward, ready_timeout: Duration) -> Result<Self, SshLaneError> {
         Self::open_with(fwd, ready_timeout, OsStr::new("ssh"))
     }
@@ -352,6 +364,19 @@ mod tests {
     fn reverse_forward_uses_dash_r_not_dash_l() {
         let argv = SshForward::reverse("host", 8000, 7000).to_argv();
         assert!(argv.iter().any(|a| a == "-R") && !argv.iter().any(|a| a == "-L"));
+    }
+
+    /// A `--` must precede the host token so a dash-leading host/user can't be
+    /// parsed as an ssh option (argument-injection guard).
+    #[test]
+    fn host_is_separated_by_double_dash() {
+        let argv = SshForward::local("-oProxyCommand=evil", 1, 2).to_argv();
+        let host_i = argv
+            .iter()
+            .position(|a| a == "-oProxyCommand=evil")
+            .expect("host present");
+        assert_eq!(argv[host_i - 1], "--", "host must be preceded by `--`");
+        assert_eq!(argv.last().unwrap(), "-oProxyCommand=evil");
     }
 
     #[test]

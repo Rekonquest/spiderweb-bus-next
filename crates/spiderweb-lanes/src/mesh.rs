@@ -7,7 +7,11 @@
 //! `session` field as a stable **origin** id: stamped once by the node that
 //! first published a message, and copied through unchanged by every forwarder.
 //! Dedup on `(origin, seq)` (edge's per-session high-water, reused exactly) makes
-//! each message reach every node's bus EXACTLY ONCE and suppresses loops.
+//! each message reach every node's bus EXACTLY ONCE and suppresses loops — for up
+//! to `SESSION_TRACK` concurrently-tracked origins. Beyond that, the oldest
+//! origin's mark is evicted, so a frame from a long-silent (evicted) origin that
+//! reappears could be re-delivered; `SESSION_TRACK` is sized (256) well above any
+//! realistic mesh fan-in.
 //!
 //! Two sockets per bridge (not one): a single-bus node that pulled and published
 //! on the same socket would re-pull its own republished frames and re-originate
@@ -216,9 +220,21 @@ impl Strand for MeshNode {
         }
 
         // ---- EGRESS step 2+3: fan out to every peer (lazy connect + replay).
+        // Don't begin a round of (bounded but real) network I/O while winding
+        // down — the kernel has no per-tick watchdog, so a blocked tick wedges
+        // this strand permanently.
+        if bus.is_shutting_down() {
+            return Ok(());
+        }
+        // Snapshot the peer list OUT of the lock so blocking I/O (dial /
+        // write_frame) never holds it: holding the lock across a slow or
+        // unreachable peer would stall every PeerHandle AND wedge this tick.
         let origin = self.origin;
-        let mut book = self.peers.lock().unwrap_or_else(|p| p.into_inner());
-        for (addr, stream_opt) in book.peers.iter_mut() {
+        let mut peers: Vec<(String, Option<TcpStream>)> = {
+            let mut book = self.peers.lock().unwrap_or_else(|p| p.into_inner());
+            std::mem::take(&mut book.peers)
+        };
+        for (addr, stream_opt) in peers.iter_mut() {
             let just_connected = if stream_opt.is_none() {
                 match dial(addr) {
                     Some(s) => {
@@ -262,7 +278,17 @@ impl Strand for MeshNode {
                 *stream_opt = None; // drop this one peer; reconnect next tick.
             }
         }
-        drop(book);
+        // Restore the snapshot, keeping any peers added via PeerHandle during I/O.
+        {
+            let mut book = self.peers.lock().unwrap_or_else(|p| p.into_inner());
+            let added = std::mem::take(&mut book.peers);
+            for (addr, stream) in added {
+                if !peers.iter().any(|(a, _)| *a == addr) {
+                    peers.push((addr, stream));
+                }
+            }
+            book.peers = peers;
+        }
 
         bus.sleep(Duration::from_millis(5));
         Ok(())

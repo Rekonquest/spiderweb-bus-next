@@ -57,11 +57,15 @@ impl std::error::Error for LaneError {}
 /// optional resource `guard`, and (for an ingress that bound a port-0 socket)
 /// the resolved address.
 ///
-/// `guard` is the reconciliation seam for lanes that own a non-strand resource:
-/// it is `None` for pure-std lanes (TCP/HTTP/API/mesh/NAT) and `Some` for SSH
-/// (it holds the tunnel whose `Drop` kills the `ssh` child). The caller keeps it
-/// alive alongside the bus so teardown order is: drop strands first (firing
-/// their `EdgeListener`-style `Drop`), then drop the guard.
+/// `guard` is the reconciliation seam for any lane that owns a non-strand
+/// resource (an `ssh` child, a relay handle): it is `None` for the pure-std
+/// lanes and `Some` for a resource-owning one, whose `Drop` tears the resource
+/// down. The caller keeps it alive alongside the bus so teardown order is: drop
+/// strands first (firing their `EdgeListener`-style `Drop`), then drop the guard.
+/// (The SSH lane currently hands its `SshTunnel` back through its own
+/// `SshLane::sender`/`listener` return value rather than a `Lane` impl; a
+/// `Lane`-shaped SSH wrapper would route that tunnel through this slot — the slot
+/// is exercised by `add_lane_returns_a_guard_for_resource_owning_lanes`.)
 pub struct LaneParts {
     /// `(suffix, strand)` pairs — the suffix ("in"/"out"/"resp"/"client"/…)
     /// disambiguates a lane's multiple strands in the kernel's name space.

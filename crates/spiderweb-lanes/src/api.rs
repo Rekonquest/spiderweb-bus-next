@@ -19,12 +19,24 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Socket the RPC request rides on (client → server).
 pub const REQUEST_SOCKET: &str = "api.request";
 /// Socket the RPC response rides on (server → client).
 pub const RESPONSE_SOCKET: &str = "api.response";
+
+/// Process-global RPC instance counter. Every `ApiClient` and `ApiHttpBridge`
+/// claims a distinct instance so their request ids never collide on a shared
+/// bus — two clients both numbering ids from 1 would mis-route each other's
+/// responses (both subscribe `RESPONSE_SOCKET`).
+static RPC_INSTANCE: AtomicU64 = AtomicU64::new(0);
+
+/// First id for a fresh RPC instance: a unique instance in the high 16 bits, the
+/// per-instance sequence in the low 48 — so distinct instances never collide.
+fn instance_id_base() -> u64 {
+    (RPC_INSTANCE.fetch_add(1, Ordering::Relaxed) << 48) | 1
+}
 
 /// An RPC request. `id` correlates it to its [`Response`]; `method` selects the
 /// handler; `params` is an opaque, caller-chosen byte payload.
@@ -189,14 +201,22 @@ impl ApiCaller {
     }
 }
 
+/// How long a pending call may wait for its response before the client reaps
+/// it. A call whose caller already timed out (dropped its receiver) and whose
+/// response never arrives would otherwise sit in `pending` forever; without a
+/// reaper, `inflight_cap` corpses would permanently wedge the client. Set well
+/// beyond any sane call timeout.
+const PENDING_TTL: Duration = Duration::from_secs(120);
+
 /// Client strand: bridges blocking [`ApiCaller`] handles to the bus. Holds the
-/// futures-free correlation map (`id -> reply channel`) across ticks.
+/// futures-free correlation map (`id -> (reply channel, queued-at)`) across
+/// ticks, reaping entries older than [`PENDING_TTL`].
 pub struct ApiClient {
     name: &'static str,
     in_socks: Vec<Socket>,
     out_socks: Vec<Socket>,
     intake_rx: Receiver<(Request, Sender<Response>)>,
-    pending: HashMap<u64, Sender<Response>>,
+    pending: HashMap<u64, (Sender<Response>, Instant)>,
     inflight_cap: usize,
 }
 
@@ -208,7 +228,7 @@ impl ApiClient {
         let (tx, rx) = mpsc::channel();
         let caller = ApiCaller {
             tx,
-            next_id: Arc::new(AtomicU64::new(1)),
+            next_id: Arc::new(AtomicU64::new(instance_id_base())),
         };
         let client = ApiClient {
             name,
@@ -226,6 +246,14 @@ impl ApiClient {
         self.inflight_cap = cap.max(1);
         self
     }
+
+    /// Drop pending entries older than [`PENDING_TTL`] — abandoned calls whose
+    /// response never arrived. Pure (takes `now`) so it is unit-testable without
+    /// a bus or a real clock.
+    fn reap_stale(&mut self, now: Instant) {
+        self.pending
+            .retain(|_, (_, queued)| now.duration_since(*queued) < PENDING_TTL);
+    }
 }
 
 impl Strand for ApiClient {
@@ -239,7 +267,9 @@ impl Strand for ApiClient {
         &self.out_socks
     }
     fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
-        // (a) accept new calls, register their reply channel, publish the request.
+        // (a) reap abandoned calls so corpses can't permanently fill `pending`.
+        self.reap_stale(Instant::now());
+        // (b) accept new calls, register their reply channel, publish the request.
         while let Ok((req, reply_tx)) = self.intake_rx.try_recv() {
             if self.pending.len() >= self.inflight_cap {
                 let _ = reply_tx.send(Response {
@@ -249,12 +279,12 @@ impl Strand for ApiClient {
                 });
                 continue;
             }
-            self.pending.insert(req.id, reply_tx);
+            self.pending.insert(req.id, (reply_tx, Instant::now()));
             let _ = bus.publish_static(REQUEST_SOCKET, req);
         }
-        // (b) route each response to its waiting caller by id (unknown id dropped).
+        // (c) route each response to its waiting caller by id (unknown id dropped).
         for resp in bus.recv::<Response>(RESPONSE_SOCKET).unwrap_or_default() {
-            if let Some(tx) = self.pending.remove(&resp.id) {
+            if let Some((tx, _)) = self.pending.remove(&resp.id) {
                 let _ = tx.send(resp);
             }
         }
@@ -275,8 +305,8 @@ pub struct ApiHttpBridge {
     in_socks: Vec<Socket>,
     out_socks: Vec<Socket>,
     next_id: u64,
-    /// api request id -> the HTTP reply_id awaiting it.
-    map: HashMap<u64, u64>,
+    /// api request id -> (HTTP reply_id awaiting it, queued-at) for reaping.
+    map: HashMap<u64, (u64, Instant)>,
 }
 
 impl ApiHttpBridge {
@@ -303,9 +333,9 @@ impl ApiHttpBridge {
                 Socket::new::<Request>(REQUEST_SOCKET),
                 Socket::new::<HttpResponse>(http_resp_socket),
             ],
-            // Offset the bridge's id space so it can't collide with an ApiClient
-            // that might also run on this bus.
-            next_id: 1u64 << 48,
+            // A distinct RPC instance so the bridge's ids never collide with an
+            // ApiClient (or another bridge) sharing this bus.
+            next_id: instance_id_base(),
             map: HashMap::new(),
         }
     }
@@ -326,6 +356,28 @@ impl Strand for ApiHttpBridge {
         &self.out_socks
     }
     fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+        // Reap api requests whose RPC Response never arrived (e.g. no ApiServer),
+        // so `map` can't grow unbounded; 504 the waiting HTTP connection.
+        let now = Instant::now();
+        let stale: Vec<(u64, u64)> = self
+            .map
+            .iter()
+            .filter(|(_, (_, t))| now.duration_since(*t) >= PENDING_TTL)
+            .map(|(id, (reply_id, _))| (*id, *reply_id))
+            .collect();
+        for (id, reply_id) in stale {
+            self.map.remove(&id);
+            let _ = bus.publish_static(
+                self.http_resp_socket,
+                HttpResponse {
+                    reply_id,
+                    status: 504,
+                    headers: Self::json_headers(),
+                    body: json::encode_error("api timeout").into_bytes(),
+                },
+            );
+        }
+
         // HTTP in -> RPC request out.
         for hreq in bus
             .recv::<HttpRequest>(self.http_req_socket)
@@ -342,7 +394,7 @@ impl Strand for ApiHttpBridge {
                         .unwrap_or_default();
                     let id = self.next_id;
                     self.next_id += 1;
-                    self.map.insert(id, hreq.reply_id);
+                    self.map.insert(id, (hreq.reply_id, Instant::now()));
                     let _ = bus.publish_static(
                         REQUEST_SOCKET,
                         Request {
@@ -367,7 +419,7 @@ impl Strand for ApiHttpBridge {
         }
         // RPC response in -> HTTP out.
         for resp in bus.recv::<Response>(RESPONSE_SOCKET).unwrap_or_default() {
-            if let Some(reply_id) = self.map.remove(&resp.id) {
+            if let Some((reply_id, _)) = self.map.remove(&resp.id) {
                 let (status, body) = if resp.ok {
                     (200, json::encode_result(&b64::encode(&resp.result)))
                 } else {
@@ -509,6 +561,55 @@ mod tests {
         assert_eq!(json::obj_get_str(body, "method"), Some("add"));
         assert_eq!(json::obj_get_str(body, "params"), Some("AgM="));
         assert_eq!(json::obj_get_str(body, "missing"), None);
+    }
+
+    /// An abandoned call (caller timed out, response never came) is reaped after
+    /// the TTL, so corpses can't permanently fill `pending` and wedge the client.
+    #[test]
+    fn abandoned_pending_calls_are_reaped() {
+        let (mut client, _caller) = ApiClient::new("api-client");
+        let (tx, _rx) = mpsc::channel::<Response>();
+        let t0 = Instant::now();
+        client.pending.insert(7, (tx, t0));
+
+        client.reap_stale(t0); // fresh — kept
+        assert_eq!(client.pending.len(), 1);
+
+        client.reap_stale(t0 + PENDING_TTL + Duration::from_secs(1)); // stale — reaped
+        assert!(
+            client.pending.is_empty(),
+            "a pending entry past the TTL must be reaped"
+        );
+    }
+
+    /// Two ApiClients on one bus must not mis-route each other's responses
+    /// (both subscribe RESPONSE_SOCKET). Distinct per-instance id prefixes keep
+    /// each client's responses matching only its own pending map.
+    #[test]
+    fn two_clients_on_one_bus_do_not_misroute() {
+        let server =
+            ApiServer::new("api-server").handle("double", |p| Ok(vec![p[0].wrapping_mul(2)]));
+        let (c1, caller1) = ApiClient::new("api-client-1");
+        let (c2, caller2) = ApiClient::new("api-client-2");
+
+        let bus_thread = thread::spawn(move || {
+            let mut bus = Bus::open();
+            bus.register(server);
+            bus.register(c1);
+            bus.register(c2);
+            bus.run_until(Some(Duration::from_millis(900)));
+        });
+        thread::sleep(Duration::from_millis(60));
+
+        let h1 =
+            thread::spawn(move || caller1.call("double", vec![10], Duration::from_millis(600)));
+        let h2 =
+            thread::spawn(move || caller2.call("double", vec![21], Duration::from_millis(600)));
+        let r1 = h1.join().unwrap().expect("client 1 call");
+        let r2 = h2.join().unwrap().expect("client 2 call");
+        assert_eq!(r1.result, vec![20], "client 1 must get its own result");
+        assert_eq!(r2.result, vec![42], "client 2 must get its own result");
+        bus_thread.join().unwrap();
     }
 
     /// Bus-native RPC: `ApiServer("add")` + `ApiClient` on one bus; a blocking
