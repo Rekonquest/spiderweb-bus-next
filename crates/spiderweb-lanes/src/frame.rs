@@ -1,11 +1,16 @@
 //! Shared binary framing for the wire lanes (mesh, NAT-inner).
 //!
-//! A **verbatim copy** of `spiderweb-edge`'s private framing — the length-
+//! A near-**verbatim copy** of `spiderweb-edge`'s private framing — the length-
 //! prefixed frame, the codec-box helpers, the session-id minter, and the sanity
 //! caps — lifted here so the mesh and NAT lanes can speak the exact same wire as
 //! the edge transport without making the production-green edge crate expose its
 //! internals. Both crates keep an independently-fuzzed copy (see
 //! `read_frame_never_panics_on_adversarial_input`, ported from edge).
+//!
+//! ONE intentional divergence from edge: `SESSION_TRACK` is 256 here (vs 16 in
+//! edge) because a mesh node dedups against MANY origins at once, not one
+//! restarting sender. The wire format and bounds are otherwise identical, so the
+//! two fuzzed copies must not be blindly re-synced on this constant.
 
 use spiderweb::BusHandle;
 use std::io::{Read, Write};

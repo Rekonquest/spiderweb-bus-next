@@ -19,19 +19,27 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// Cap a slow client that opens a connection then stalls mid-request.
+/// Cap a slow client that opens a connection then stalls mid-request, AND a
+/// slow client that stops reading its response (a write to a full send buffer
+/// would otherwise hang the responder tick forever — the kernel has no per-tick
+/// watchdog, so a blocked `run()` wedges that strand permanently).
 const READ_TIMEOUT_SECS: u64 = 30;
 /// Bound the accept-thread → strand handoff (backpressure, like the edge lane).
 const ACCEPT_CHANNEL_CAP: usize = 256;
 /// Cap connections parked awaiting a handler reply, so a flood (or a handler
 /// that never answers some `reply_id`) can't hold unbounded open sockets.
 const MAX_PENDING: usize = 1024;
+/// Reap a parked connection whose handler never replied after this long, so
+/// orphans can't accumulate to `MAX_PENDING` and permanently 503 every new
+/// request. Set well beyond any reasonable handler latency.
+const PENDING_TTL: Duration = Duration::from_secs(120);
 
 /// Connections parked between request-publish and response-write, keyed by
-/// `reply_id`. Shared by the accept thread (inserts) and the responder (removes).
-type Pending = Arc<Mutex<HashMap<u64, TcpStream>>>;
+/// `reply_id`, each stamped with when it was parked (for the reaper). Shared by
+/// the accept thread (inserts) and the responder (removes + reaps).
+type Pending = Arc<Mutex<HashMap<u64, (TcpStream, Instant)>>>;
 
 /// Builder for the server side. `req_socket` is where parsed requests are
 /// published; `resp_socket` is where handler replies are read. One `HttpServer`
@@ -105,6 +113,9 @@ fn accept_loop(
             Err(_) => continue,
         };
         let _ = stream.set_read_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)));
+        // A write timeout too: the responder writes this parked stream INSIDE
+        // its tick, so a client that stops reading must not be able to hang it.
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)));
         let reply_id = next_id;
         next_id += 1;
         let req = match parse_request(&mut stream, reply_id) {
@@ -118,7 +129,7 @@ fn accept_loop(
                 let _ = write_response(&mut stream, &HttpResponse::status(reply_id, 503));
                 continue;
             }
-            map.insert(reply_id, stream);
+            map.insert(reply_id, (stream, Instant::now()));
         }
         // Hand the request to the strand. If the receiver is gone (teardown) or
         // we're shutting down, reclaim the parked socket and stop.
@@ -215,6 +226,10 @@ impl Strand for HttpResponder {
         &[]
     }
     fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+        // Reap orphaned parked connections (handler never answered) so they
+        // can't accumulate to MAX_PENDING and permanently 503 new requests.
+        self.reap_stale(Instant::now());
+
         for resp in bus
             .recv::<HttpResponse>(self.resp_socket)
             .unwrap_or_default()
@@ -224,7 +239,7 @@ impl Strand for HttpResponder {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(&resp.reply_id);
-            if let Some(mut stream) = parked {
+            if let Some((mut stream, _)) = parked {
                 let _ = write_response(&mut stream, &resp);
                 // stream drops here → connection closes.
             }
@@ -232,5 +247,72 @@ impl Strand for HttpResponder {
         }
         bus.sleep(Duration::from_millis(5));
         Ok(())
+    }
+}
+
+impl HttpResponder {
+    /// Drop parked connections older than [`PENDING_TTL`] (a handler that never
+    /// answered), writing a 504 before closing so the client isn't left hanging.
+    /// Takes `now` so it is unit-testable without a real clock.
+    fn reap_stale(&self, now: Instant) {
+        let stale: Vec<u64> = {
+            let map = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+            map.iter()
+                .filter(|(_, (_, t))| now.duration_since(*t) >= PENDING_TTL)
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        for id in stale {
+            let entry = self
+                .pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&id);
+            if let Some((mut stream, _)) = entry {
+                let _ = write_response(&mut stream, &HttpResponse::status(id, 504));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A parked connection whose handler never replies is reaped after the TTL,
+    /// so orphans can't fill MAX_PENDING and permanently 503 the server.
+    #[test]
+    fn orphaned_parked_connections_are_reaped() {
+        let server = HttpServer::new("http.req", "http.resp");
+        let responder = server.responder();
+
+        // Park a real, connected server-side stream (keep the client end alive).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).unwrap();
+        let (parked, _) = listener.accept().unwrap();
+        let t0 = Instant::now();
+        responder
+            .pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(7, (parked, t0));
+
+        responder.reap_stale(t0); // fresh — kept
+        assert_eq!(
+            responder
+                .pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .len(),
+            1
+        );
+
+        responder.reap_stale(t0 + PENDING_TTL + Duration::from_secs(1)); // stale — reaped
+        assert!(responder
+            .pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty());
     }
 }

@@ -38,6 +38,9 @@ const KIND_LEAVE: u8 = 0x03;
 /// Outer cap on a DATA blob (an inner edge frame). The relay never parses the
 /// inner frame, so this is its only size bound.
 const MAX_ROOM_BLOB: usize = MAX_PAYLOAD + MAX_TAG + 64;
+/// Bound a relay→peer forward write, so a slow/stuck target can't block the
+/// forwarding peer's loop (and thus the whole room) indefinitely.
+const RELAY_WRITE_TIMEOUT_SECS: u64 = 5;
 
 /// Where a peer rendezvouses: the relay address, the room, and this peer's id.
 #[derive(Clone, Debug)]
@@ -164,6 +167,17 @@ impl Relay {
             let stop = stop.clone();
             thread::spawn(move || handle_peer(stream, rooms, stop));
         }
+        // Stop set: the detached per-peer reader threads are blocked in
+        // read_room_msg on idle connections and won't observe `stop` until a
+        // byte arrives. Shut each peer's socket down so they get EOF and exit
+        // promptly instead of lingering.
+        let guard = rooms.lock().unwrap_or_else(|p| p.into_inner());
+        for peers in guard.values() {
+            for p in peers {
+                let s = p.write.lock().unwrap_or_else(|x| x.into_inner());
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+        }
         Ok(())
     }
 }
@@ -175,7 +189,13 @@ fn handle_peer(mut read_half: TcpStream, rooms: Rooms, stop: Arc<AtomicBool>) {
         _ => return,
     };
     let write_half = match read_half.try_clone() {
-        Ok(w) => Arc::new(Mutex::new(w)),
+        Ok(w) => {
+            // A write to a slow/stuck target must not block this peer's forward
+            // loop forever; bound it (we leave the READ side blocking so a
+            // merely-idle peer is not disconnected).
+            let _ = w.set_write_timeout(Some(Duration::from_secs(RELAY_WRITE_TIMEOUT_SECS)));
+            Arc::new(Mutex::new(w))
+        }
         Err(_) => return,
     };
     rooms
@@ -486,9 +506,17 @@ fn relay_reader(
     conn: Arc<Mutex<Option<TcpStream>>>,
 ) {
     while !shutdown.load(Ordering::Acquire) {
-        let mut s = match TcpStream::connect(&addr.relay) {
-            Ok(s) => s,
-            Err(_) => {
+        // Bounded connect so a dead/firewalled relay can't block this thread (and
+        // thus the listener's Drop join) for the OS default connect timeout.
+        let mut s = match addr
+            .relay
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut a| a.next())
+            .and_then(|sa| TcpStream::connect_timeout(&sa, Duration::from_secs(2)).ok())
+        {
+            Some(s) => s,
+            None => {
                 thread::sleep(Duration::from_millis(200));
                 continue;
             }
@@ -499,6 +527,12 @@ fn relay_reader(
         }
         if write_join(&mut s, addr.room, addr.peer_id).is_err() {
             continue;
+        }
+        // Close the Drop-vs-conn-store race: if shutdown was set between storing
+        // `conn` and here, exit now instead of blocking in the read below (where
+        // Drop's shutdown(conn) might have already fired against the old None).
+        if shutdown.load(Ordering::Acquire) {
+            return;
         }
         loop {
             match read_room_msg(&mut s) {
