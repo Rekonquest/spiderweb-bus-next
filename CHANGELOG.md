@@ -79,5 +79,6 @@ several findings were permanent-wedge DoS vectors.
   cross-machine causality (ITC) are the remaining tiers.
 - Lanes: HTTP/API/mesh/NAT are plaintext — the **SSH lane** is how you encrypt
   any of them today (composes system `ssh`, zero crypto deps). The HTTP lane is
-  `Connection: close` (no keep-alive yet); the NAT relay is a coordination
-  convenience (single point of failure, double bandwidth), not a trust boundary.
+  HTTP/1.1 keep-alive (one request in flight per connection, no pipelining); the
+  NAT relay is a coordination convenience (single point of failure, double
+  bandwidth), not a trust boundary.

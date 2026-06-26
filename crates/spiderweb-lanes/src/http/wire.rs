@@ -3,12 +3,14 @@
 //! `std::io`. This is pure mechanism (parse bytes ⇄ structs); the lane strands
 //! (in `super`) carry the policy (correlation, who replies, concurrency).
 //!
-//! Scope: HTTP/1.1, `Content-Length`-delimited bodies, one request per parse
-//! call. Chunked transfer-encoding and keep-alive pipelining are documented
-//! non-goals for the MVP (the server answers `Connection: close`). Every length
-//! is bounded before allocation so a hostile peer can't trigger a huge alloc.
+//! Scope: HTTP/1.1, `Content-Length`-delimited bodies. The parser reads one
+//! request from a persistent `&mut R: BufRead`, so a caller drives keep-alive by
+//! calling it repeatedly on one connection (the server lane does). Chunked
+//! transfer-encoding and pipelined (overlapping) requests are documented
+//! non-goals. Every length is bounded before allocation so a hostile peer can't
+//! trigger a huge alloc.
 
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 
 /// Cap the request line + all headers so a peer can't make us buffer forever.
 pub const MAX_HEAD: usize = 64 * 1024;
@@ -69,6 +71,15 @@ impl HttpRequest {
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
     }
+
+    /// Whether to keep the connection open after answering (HTTP/1.1 default
+    /// keep-alive unless the client sent `Connection: close`).
+    pub fn wants_keep_alive(&self) -> bool {
+        match self.header("connection") {
+            Some(c) => !c.eq_ignore_ascii_case("close"),
+            None => true,
+        }
+    }
 }
 
 /// An outbound HTTP request the client lane should perform, published onto the
@@ -99,13 +110,13 @@ pub struct HttpResult {
 /// correlation. Returns `Err` (which the caller turns into a dropped/!closed
 /// connection) on malformed input, an over-cap head/body, or EOF. Never panics
 /// and never allocates a body larger than `MAX_BODY`.
-pub fn parse_request<R: Read>(r: R, reply_id: u64) -> io::Result<HttpRequest> {
-    let mut reader = BufReader::new(r);
-
+/// Takes a persistent `&mut R: BufRead` so a caller can parse SEVERAL requests
+/// off one keep-alive connection without losing buffered bytes between them.
+pub fn parse_request<R: BufRead>(reader: &mut R, reply_id: u64) -> io::Result<HttpRequest> {
     // --- request line + headers: read lines until a blank line, bounded ---
     let mut head_bytes = 0usize;
     let mut line = String::new();
-    head_bytes += read_line_bounded(&mut reader, &mut line, MAX_HEAD - head_bytes)?;
+    head_bytes += read_line_bounded(reader, &mut line, MAX_HEAD - head_bytes)?;
     let request_line = line.trim_end().to_string();
     let mut parts = request_line.split_whitespace();
     let method = parts
@@ -121,7 +132,7 @@ pub fn parse_request<R: Read>(r: R, reply_id: u64) -> io::Result<HttpRequest> {
     let mut headers: Vec<(String, String)> = Vec::new();
     loop {
         line.clear();
-        head_bytes += read_line_bounded(&mut reader, &mut line, MAX_HEAD - head_bytes)?;
+        head_bytes += read_line_bounded(reader, &mut line, MAX_HEAD - head_bytes)?;
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break; // blank line terminates the header block
@@ -169,10 +180,16 @@ fn read_line_bounded<R: BufRead>(r: &mut R, buf: &mut String, budget: usize) -> 
     Ok(n)
 }
 
-/// Serialize an [`HttpResponse`] to `w` as HTTP/1.1 with `Connection: close`
-/// and a `Content-Length`. Any caller-supplied `Content-Length`/`Connection`
-/// headers are dropped (we set them) to keep the framing self-consistent.
-pub fn write_response<W: Write>(w: &mut W, resp: &HttpResponse) -> io::Result<()> {
+/// Serialize an [`HttpResponse`] to `w` as HTTP/1.1 with a `Content-Length` and
+/// a `Connection:` header (`keep-alive` or `close`). Any caller-supplied
+/// `Content-Length`/`Connection` headers are dropped (we set them) so the
+/// framing stays self-consistent — `Content-Length` is what lets a keep-alive
+/// client find the response boundary and send its next request.
+pub fn write_response<W: Write>(
+    w: &mut W,
+    resp: &HttpResponse,
+    keep_alive: bool,
+) -> io::Result<()> {
     let reason = reason_phrase(resp.status);
     write!(w, "HTTP/1.1 {} {}\r\n", resp.status, reason)?;
     for (k, v) in &resp.headers {
@@ -182,7 +199,11 @@ pub fn write_response<W: Write>(w: &mut W, resp: &HttpResponse) -> io::Result<()
         write!(w, "{}: {}\r\n", k, v)?;
     }
     write!(w, "Content-Length: {}\r\n", resp.body.len())?;
-    write!(w, "Connection: close\r\n")?;
+    write!(
+        w,
+        "Connection: {}\r\n",
+        if keep_alive { "keep-alive" } else { "close" }
+    )?;
     w.write_all(b"\r\n")?;
     w.write_all(&resp.body)?;
     w.flush()
@@ -213,22 +234,41 @@ mod tests {
     #[test]
     fn parses_a_get_with_no_body() {
         let raw = b"GET /hello?x=1 HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\n\r\n";
-        let req = parse_request(&raw[..], 7).expect("parse");
+        let mut r: &[u8] = &raw[..];
+        let req = parse_request(&mut r, 7).expect("parse");
         assert_eq!(req.reply_id, 7);
         assert_eq!(req.method, "GET");
         assert_eq!(req.path, "/hello?x=1");
         assert_eq!(req.header("host"), Some("localhost"));
         assert!(req.body.is_empty());
+        assert!(req.wants_keep_alive(), "HTTP/1.1 defaults to keep-alive");
     }
 
     #[test]
     fn parses_a_post_with_content_length_body() {
         let raw =
             b"POST /api HTTP/1.1\r\nContent-Length: 5\r\nContent-Type: text/plain\r\n\r\nhello";
-        let req = parse_request(&raw[..], 1).expect("parse");
+        let mut r: &[u8] = &raw[..];
+        let req = parse_request(&mut r, 1).expect("parse");
         assert_eq!(req.method, "POST");
         assert_eq!(req.body, b"hello");
         assert_eq!(req.header("CONTENT-TYPE"), Some("text/plain")); // case-insensitive
+    }
+
+    #[test]
+    fn parses_two_pipelined_requests_off_one_reader() {
+        // The persistent reader must yield BOTH requests on one connection.
+        let raw = b"GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nConnection: close\r\n\r\n";
+        let mut r: &[u8] = &raw[..];
+        let first = parse_request(&mut r, 1).expect("first");
+        assert_eq!(first.path, "/a");
+        assert!(first.wants_keep_alive());
+        let second = parse_request(&mut r, 2).expect("second");
+        assert_eq!(second.path, "/b");
+        assert!(
+            !second.wants_keep_alive(),
+            "Connection: close ends keep-alive"
+        );
     }
 
     #[test]
@@ -237,7 +277,8 @@ mod tests {
             "POST /x HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
             MAX_BODY + 1
         );
-        let err = parse_request(raw.as_bytes(), 0).unwrap_err();
+        let mut r = raw.as_bytes();
+        let err = parse_request(&mut r, 0).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -247,7 +288,8 @@ mod tests {
         let mut raw = b"GET / HTTP/1.1\r\nX-Big: ".to_vec();
         raw.extend(std::iter::repeat_n(b'a', MAX_HEAD + 16));
         raw.extend_from_slice(b"\r\n\r\n");
-        let err = parse_request(&raw[..], 0).unwrap_err();
+        let mut r: &[u8] = &raw[..];
+        let err = parse_request(&mut r, 0).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -255,19 +297,25 @@ mod tests {
     fn round_trips_a_response() {
         let resp = HttpResponse::text(42, "pong");
         let mut buf = Vec::new();
-        write_response(&mut buf, &resp).expect("write");
+        write_response(&mut buf, &resp, true).expect("write");
         let s = String::from_utf8(buf).unwrap();
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(s.contains("Content-Length: 4\r\n"));
-        assert!(s.contains("Connection: close\r\n"));
+        assert!(s.contains("Connection: keep-alive\r\n"));
         assert!(s.ends_with("\r\n\r\npong"));
+
+        let mut closed = Vec::new();
+        write_response(&mut closed, &resp, false).expect("write");
+        assert!(String::from_utf8(closed)
+            .unwrap()
+            .contains("Connection: close\r\n"));
     }
 
     #[test]
     fn status_only_response_has_empty_body() {
         let resp = HttpResponse::status(9, 404);
         let mut buf = Vec::new();
-        write_response(&mut buf, &resp).expect("write");
+        write_response(&mut buf, &resp, false).expect("write");
         let s = String::from_utf8(buf).unwrap();
         assert!(s.starts_with("HTTP/1.1 404 Not Found\r\n"));
         assert!(s.contains("Content-Length: 0\r\n"));
