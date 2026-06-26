@@ -48,6 +48,23 @@ layer is an honest trusted-network MVP. See
   crash/restart churn (lazy pruning).
 - **`webctl top`** live dashboard; `EdgeListener::Drop` clean teardown.
 
+### Hardened — lanes (post-audit)
+A multi-agent adversarial audit of `spiderweb-lanes` found 16 confirmed
+reliability issues; all fixed + regression-tested. The systemic one: the kernel
+has no per-tick watchdog, so a blocking `run()` wedges that strand permanently —
+several findings were permanent-wedge DoS vectors.
+- **HTTP**: response writes moved off the strand tick onto a worker pool (a slow
+  consumer can't head-of-line-block others); write timeout on parked sockets;
+  parked-connection table reaped (orphans can't reach `MAX_PENDING` → 503).
+- **API**: `ApiClient`/`ApiHttpBridge` pending maps reaped (no corpse wedge);
+  per-instance RPC id prefixes (two clients on one bus never mis-route).
+- **mesh**: egress does network I/O outside the `PeerBook` lock (one slow peer
+  can't wedge the tick); per-connection reader threads (a node serves all
+  inbound peers, not just the first).
+- **NAT**: write timeouts on relay peers; `serve_until`/`Drop` teardown stops
+  lingering reader threads; bounded relay-reader connect.
+- **SSH**: `--` before the host (option-injection guard).
+
 ### Tested — quality gates (Phase 4)
 - Randomized **fuzz** of the wire parser (200k adversarial inputs, std-only).
 - **Property tests**: exactly-once fan-out (random shapes); heat-kernel mass
@@ -60,3 +77,7 @@ layer is an honest trusted-network MVP. See
 - Edge reliability is a bounded resend ring (sender restarts handled via session
   IDs); unbounded/no-head-of-line-blocking reliability (RLNC tier-2) and
   cross-machine causality (ITC) are the remaining tiers.
+- Lanes: HTTP/API/mesh/NAT are plaintext — the **SSH lane** is how you encrypt
+  any of them today (composes system `ssh`, zero crypto deps). The HTTP lane is
+  `Connection: close` (no keep-alive yet); the NAT relay is a coordination
+  convenience (single point of failure, double bandwidth), not a trust boundary.
