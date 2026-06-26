@@ -22,7 +22,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::BufReader;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -43,10 +43,13 @@ const MAX_PENDING: usize = 1024;
 const PENDING_TTL: Duration = Duration::from_secs(120);
 
 /// One in-flight request, keyed by `reply_id`: a WRITE-half clone of the
-/// connection, whether to keep it open after the reply (keep-alive), and when it
-/// was parked (for the reaper). Shared by the per-connection reader threads
+/// connection, whether to keep it open after the reply (keep-alive), when it was
+/// parked (for the reaper), and a one-shot `done` sender fired once the reply is
+/// written — the connection thread waits on it before reading the next request,
+/// so exactly one request is in flight per connection and responses can't
+/// reorder (pipelining safety). Shared by the per-connection reader threads
 /// (insert) and the responder (remove + reap).
-type Pending = Arc<Mutex<HashMap<u64, (TcpStream, bool, Instant)>>>;
+type Pending = Arc<Mutex<HashMap<u64, (TcpStream, bool, Instant, Sender<()>)>>>;
 
 /// How many response writes run concurrently off the responder tick. Response
 /// writes can BLOCK (a client that stops reading fills the send buffer), so they
@@ -56,16 +59,20 @@ type Pending = Arc<Mutex<HashMap<u64, (TcpStream, bool, Instant)>>>;
 const RESPONDER_LANES: usize = 8;
 
 /// A queued response write: send `resp` on `stream`, keeping the connection open
-/// iff `keep_alive`.
-type WriteJob = (TcpStream, HttpResponse, bool);
+/// iff `keep_alive`, then fire `done` so the connection thread may read the next
+/// request.
+type WriteJob = (TcpStream, HttpResponse, bool, Sender<()>);
 
 /// The blocking write, run on a [`Highway`] worker (off the strand tick). The
 /// stream carries a write timeout (set per connection), so a stuck client bounds
 /// a worker, never the tick. The write-half clone drops here; the socket stays
 /// open while the connection's read-half lives (keep-alive) and closes once all
-/// handles drop (Connection: close → the reader has already stopped).
-fn write_job((mut stream, resp, keep_alive): WriteJob) {
+/// handles drop (Connection: close → the reader has already stopped). Firing
+/// `done` (after the write completes) is what releases the connection thread to
+/// read its next request — keeping exactly one reply in flight, in order.
+fn write_job((mut stream, resp, keep_alive, done): WriteJob) {
     let _ = write_response(&mut stream, &resp, keep_alive);
+    let _ = done.send(());
 }
 
 /// Builder for the server side. `req_socket` is where parsed requests are
@@ -186,6 +193,7 @@ fn serve_connection(
             Ok(s) => s,
             Err(_) => return,
         };
+        let (done_tx, done_rx) = mpsc::channel::<()>();
         // Bound the parked table: refuse (503) rather than grow it.
         {
             let mut map = pending.lock().unwrap_or_else(|p| p.into_inner());
@@ -194,7 +202,7 @@ fn serve_connection(
                     write_response(&mut write_half, &HttpResponse::status(reply_id, 503), false);
                 return; // shed load by closing this connection
             }
-            map.insert(reply_id, (write_half, keep_alive, Instant::now()));
+            map.insert(reply_id, (write_half, keep_alive, Instant::now(), done_tx));
         }
         // Hand the request to the strand. If the receiver is gone (teardown) or
         // we're shutting down, reclaim the parked write-half and stop.
@@ -207,6 +215,16 @@ fn serve_connection(
         }
         if !keep_alive {
             return; // client asked to close after this request.
+        }
+        // Keep-alive: wait until THIS reply has been written before reading the
+        // next request, so only one reply is in flight per connection (responses
+        // can't reorder) and a pipelining client's buffered request is parsed in
+        // order. A reply that never comes within the idle bound closes the conn.
+        if done_rx
+            .recv_timeout(Duration::from_secs(READ_TIMEOUT_SECS))
+            .is_err()
+        {
+            return;
         }
     }
 }
@@ -316,8 +334,8 @@ impl Strand for HttpResponder {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(&resp.reply_id);
-            if let Some((stream, keep_alive, _)) = parked {
-                self.backlog.push_back((stream, resp, keep_alive));
+            if let Some((stream, keep_alive, _, done)) = parked {
+                self.backlog.push_back((stream, resp, keep_alive, done));
             }
             // An unknown reply_id (already answered / timed out) is dropped.
         }
@@ -348,7 +366,7 @@ impl HttpResponder {
         let stale: Vec<u64> = {
             let map = self.pending.lock().unwrap_or_else(|p| p.into_inner());
             map.iter()
-                .filter(|(_, (_, _, t))| now.duration_since(*t) >= PENDING_TTL)
+                .filter(|(_, (_, _, t, _))| now.duration_since(*t) >= PENDING_TTL)
                 .map(|(id, _)| *id)
                 .collect()
         };
@@ -359,8 +377,8 @@ impl HttpResponder {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(&id);
-            if let Some((stream, _, _)) = entry {
-                jobs.push((stream, HttpResponse::status(id, 504), false));
+            if let Some((stream, _, _, done)) = entry {
+                jobs.push((stream, HttpResponse::status(id, 504), false, done));
             }
         }
         jobs
@@ -384,11 +402,12 @@ mod tests {
         let _client = TcpStream::connect(addr).unwrap();
         let (parked, _) = listener.accept().unwrap();
         let t0 = Instant::now();
+        let (done_tx, _done_rx) = mpsc::channel::<()>();
         responder
             .pending
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(7, (parked, false, t0));
+            .insert(7, (parked, false, t0, done_tx));
 
         responder.reap_stale(t0); // fresh — kept
         assert_eq!(
@@ -595,6 +614,93 @@ mod tests {
             "second reply on same conn: {r2:?}"
         );
         assert!(r2.contains("Connection: close"), "second reply: {r2:?}");
+
+        bus_thread.join().unwrap();
+    }
+
+    /// A PIPELINING client (sends both requests before reading) must get its
+    /// responses IN ORDER. The first reply is large (slow write); under the old
+    /// in-order-not-guaranteed design the small second reply could land first and
+    /// desync the stream. Per-connection serialization makes ordering impossible
+    /// to violate.
+    #[test]
+    fn pipelined_requests_get_in_order_responses() {
+        use spiderweb::Bus;
+        use std::io::{BufReader, Write};
+
+        let server = HttpServer::new("pl.req", "pl.resp");
+        let ingress = server.ingress("127.0.0.1:0").expect("bind");
+        let port = ingress.local_addr().port();
+        let responder = server.responder();
+
+        struct Sized;
+        impl Strand for Sized {
+            fn name(&self) -> &str {
+                "sized"
+            }
+            fn inputs(&self) -> &[Socket] {
+                const S: Socket = Socket::new::<HttpRequest>("pl.req");
+                std::slice::from_ref(&S)
+            }
+            fn outputs(&self) -> &[Socket] {
+                const S: Socket = Socket::new::<HttpResponse>("pl.resp");
+                std::slice::from_ref(&S)
+            }
+            fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+                for r in bus.recv::<HttpRequest>("pl.req").unwrap_or_default() {
+                    // /first → a large body (slow write); else → tiny.
+                    let body = if r.path == "/first" {
+                        vec![b'A'; 600_000]
+                    } else {
+                        b"second".to_vec()
+                    };
+                    let _ = bus.publish_static(
+                        "pl.resp",
+                        HttpResponse {
+                            reply_id: r.reply_id,
+                            status: 200,
+                            headers: Vec::new(),
+                            body,
+                        },
+                    );
+                }
+                bus.sleep(Duration::from_millis(5));
+                Ok(())
+            }
+        }
+
+        let bus_thread = thread::spawn(move || {
+            let mut bus = Bus::open();
+            bus.register(ingress);
+            bus.register(responder);
+            bus.register(Sized);
+            bus.run_until(Some(Duration::from_millis(3000)));
+        });
+        thread::sleep(Duration::from_millis(80));
+
+        let conn = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        conn.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut writer = conn.try_clone().unwrap();
+        let mut reader = BufReader::new(conn);
+
+        // Pipeline BOTH requests before reading either response.
+        writer
+            .write_all(b"GET /first HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap();
+        writer
+            .write_all(b"GET /second HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        writer.flush().unwrap();
+
+        // Responses MUST arrive in request order: the large /first, then /second.
+        let r1 = read_http_response(&mut reader);
+        assert!(
+            r1.contains("Content-Length: 600000"),
+            "first response must be the large /first reply, not the small one: {:?}",
+            &r1[..r1.len().min(120)]
+        );
+        let r2 = read_http_response(&mut reader);
+        assert!(r2.ends_with("second"), "second response: {r2:?}");
 
         bus_thread.join().unwrap();
     }
