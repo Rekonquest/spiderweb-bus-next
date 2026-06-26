@@ -1,22 +1,27 @@
 //! HTTP server lane: turn inbound HTTP/1.1 requests into bus messages and write
 //! bus responses back to the right connection.
 //!
-//! Two strands share one bounded pending-socket table:
-//! - [`HttpIngress`] owns the accept/parse thread (the `EdgeListener` pattern):
-//!   it parks each still-open connection in the table keyed by a `reply_id` and
-//!   publishes the parsed [`HttpRequest`] on the bus.
+//! Two strands share one bounded pending table:
+//! - [`HttpIngress`] owns the acceptor thread, which serves each connection on
+//!   its own thread: a persistent reader parses successive requests off a
+//!   keep-alive connection, parks a write-half clone per request keyed by a
+//!   globally-unique `reply_id`, and publishes each [`HttpRequest`] on the bus.
 //! - [`HttpResponder`] subscribes to [`HttpResponse`], pops the matching
-//!   connection out of the table, writes the HTTP/1.1 reply, and closes it.
+//!   write-half out of the table, and writes the HTTP/1.1 reply on a worker pool
+//!   (off the strand tick) — keeping the connection open for the next request
+//!   (keep-alive) or closing it (`Connection: close` / HTTP idle timeout).
 //!
-//! MVP scope: `Connection: close` (one request per connection), so correlation
-//! is exactly the `reply_id`. Keep-alive pipelining is a documented follow-on.
+//! Persistent connections are supported (HTTP/1.1 default keep-alive). One
+//! request is in flight per connection at a time (no pipelined overlap); the
+//! `Content-Length` on every response lets the client find the boundary.
 
 use super::wire::{parse_request, write_response, HttpRequest, HttpResponse};
 use highway::Highway;
 use spiderweb::{register_clone_type, BusHandle, Socket, Strand, StrandError};
 use std::collections::{HashMap, VecDeque};
+use std::io::BufReader;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -37,10 +42,11 @@ const MAX_PENDING: usize = 1024;
 /// request. Set well beyond any reasonable handler latency.
 const PENDING_TTL: Duration = Duration::from_secs(120);
 
-/// Connections parked between request-publish and response-write, keyed by
-/// `reply_id`, each stamped with when it was parked (for the reaper). Shared by
-/// the accept thread (inserts) and the responder (removes + reaps).
-type Pending = Arc<Mutex<HashMap<u64, (TcpStream, Instant)>>>;
+/// One in-flight request, keyed by `reply_id`: a WRITE-half clone of the
+/// connection, whether to keep it open after the reply (keep-alive), and when it
+/// was parked (for the reaper). Shared by the per-connection reader threads
+/// (insert) and the responder (remove + reap).
+type Pending = Arc<Mutex<HashMap<u64, (TcpStream, bool, Instant)>>>;
 
 /// How many response writes run concurrently off the responder tick. Response
 /// writes can BLOCK (a client that stops reading fills the send buffer), so they
@@ -49,15 +55,17 @@ type Pending = Arc<Mutex<HashMap<u64, (TcpStream, Instant)>>>;
 /// pool decouples a slow consumer from delivery to everyone else.
 const RESPONDER_LANES: usize = 8;
 
-/// A queued response write: send `resp` back on `stream`, then close it.
-type WriteJob = (TcpStream, HttpResponse);
+/// A queued response write: send `resp` on `stream`, keeping the connection open
+/// iff `keep_alive`.
+type WriteJob = (TcpStream, HttpResponse, bool);
 
 /// The blocking write, run on a [`Highway`] worker (off the strand tick). The
-/// stream carries a write timeout (set in `accept_loop`), so a stuck client
-/// bounds a worker, never the tick.
-fn write_job((mut stream, resp): WriteJob) {
-    let _ = write_response(&mut stream, &resp);
-    // stream drops here → connection closes.
+/// stream carries a write timeout (set per connection), so a stuck client bounds
+/// a worker, never the tick. The write-half clone drops here; the socket stays
+/// open while the connection's read-half lives (keep-alive) and closes once all
+/// handles drop (Connection: close → the reader has already stopped).
+fn write_job((mut stream, resp, keep_alive): WriteJob) {
+    let _ = write_response(&mut stream, &resp, keep_alive);
 }
 
 /// Builder for the server side. `req_socket` is where parsed requests are
@@ -92,7 +100,7 @@ impl HttpServer {
         let shutdown = Arc::new(AtomicBool::new(false));
         let pending = self.pending.clone();
         let sd = shutdown.clone();
-        let accept = thread::spawn(move || accept_loop(listener, tx, pending, sd));
+        let accept = thread::spawn(move || acceptor(listener, tx, pending, sd));
         Ok(HttpIngress {
             req_socket: self.req_socket,
             out_socks: vec![Socket::new::<HttpRequest>(self.req_socket)],
@@ -116,50 +124,89 @@ impl HttpServer {
     }
 }
 
-/// Accept connections; parse one request per connection (Connection: close);
-/// park the still-open socket in `pending` and hand the request to the strand.
-fn accept_loop(
+/// Accept connections and serve EACH on its own thread, so one keep-alive
+/// connection (which lingers idle between requests) can't block accepting
+/// others. `reply_id`s are minted from one shared counter so they are unique
+/// across all connections (the responder routes globally by `reply_id`).
+fn acceptor(
     listener: TcpListener,
     tx: SyncSender<HttpRequest>,
     pending: Pending,
     shutdown: Arc<AtomicBool>,
 ) {
-    let mut next_id: u64 = 1;
+    let next_id = Arc::new(AtomicU64::new(1));
     for conn in listener.incoming() {
         if shutdown.load(Ordering::Acquire) {
             return; // listener dropped: release the port.
         }
-        let mut stream = match conn {
+        let stream = match conn {
             Ok(s) => s,
             Err(_) => continue,
         };
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)));
-        // A write timeout too: the responder writes this parked stream INSIDE
-        // its tick, so a client that stops reading must not be able to hang it.
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)));
-        let reply_id = next_id;
-        next_id += 1;
-        let req = match parse_request(&mut stream, reply_id) {
+        let tx = tx.clone();
+        let pending = pending.clone();
+        let shutdown = shutdown.clone();
+        let next_id = next_id.clone();
+        thread::spawn(move || serve_connection(stream, tx, pending, shutdown, next_id));
+    }
+}
+
+/// Serve one connection: parse requests off a persistent reader until the client
+/// closes (EOF), asks to close (`Connection: close`), or goes idle past the read
+/// timeout (the keep-alive idle bound). Each request parks a fresh write-half
+/// clone keyed by a globally-unique `reply_id`; the responder writes + drops it.
+fn serve_connection(
+    stream: TcpStream,
+    tx: SyncSender<HttpRequest>,
+    pending: Pending,
+    shutdown: Arc<AtomicBool>,
+    next_id: Arc<AtomicU64>,
+) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)));
+    // Read on a private clone wrapped in a persistent BufReader (so bytes
+    // buffered between requests aren't lost); each parked write uses its own
+    // clone, so concurrent read (here) + write (responder pool) never conflict.
+    let read_half = match stream.try_clone() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let mut reader = BufReader::new(read_half);
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        let reply_id = next_id.fetch_add(1, Ordering::Relaxed);
+        let req = match parse_request(&mut reader, reply_id) {
             Ok(r) => r,
-            Err(_) => continue, // malformed/EOF/timeout: drop the connection.
+            Err(_) => return, // EOF / idle-timeout / malformed: close.
         };
-        // Bound the parked-connection table: refuse (503) rather than grow it.
+        let keep_alive = req.wants_keep_alive();
+        let mut write_half = match stream.try_clone() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        // Bound the parked table: refuse (503) rather than grow it.
         {
             let mut map = pending.lock().unwrap_or_else(|p| p.into_inner());
             if map.len() >= MAX_PENDING {
-                let _ = write_response(&mut stream, &HttpResponse::status(reply_id, 503));
-                continue;
+                let _ =
+                    write_response(&mut write_half, &HttpResponse::status(reply_id, 503), false);
+                return; // shed load by closing this connection
             }
-            map.insert(reply_id, (stream, Instant::now()));
+            map.insert(reply_id, (write_half, keep_alive, Instant::now()));
         }
         // Hand the request to the strand. If the receiver is gone (teardown) or
-        // we're shutting down, reclaim the parked socket and stop.
+        // we're shutting down, reclaim the parked write-half and stop.
         if shutdown.load(Ordering::Acquire) || tx.send(req).is_err() {
             pending
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(&reply_id);
             return;
+        }
+        if !keep_alive {
+            return; // client asked to close after this request.
         }
     }
 }
@@ -269,8 +316,8 @@ impl Strand for HttpResponder {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(&resp.reply_id);
-            if let Some((stream, _)) = parked {
-                self.backlog.push_back((stream, resp));
+            if let Some((stream, keep_alive, _)) = parked {
+                self.backlog.push_back((stream, resp, keep_alive));
             }
             // An unknown reply_id (already answered / timed out) is dropped.
         }
@@ -301,7 +348,7 @@ impl HttpResponder {
         let stale: Vec<u64> = {
             let map = self.pending.lock().unwrap_or_else(|p| p.into_inner());
             map.iter()
-                .filter(|(_, (_, t))| now.duration_since(*t) >= PENDING_TTL)
+                .filter(|(_, (_, _, t))| now.duration_since(*t) >= PENDING_TTL)
                 .map(|(id, _)| *id)
                 .collect()
         };
@@ -312,8 +359,8 @@ impl HttpResponder {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(&id);
-            if let Some((stream, _)) = entry {
-                jobs.push((stream, HttpResponse::status(id, 504)));
+            if let Some((stream, _, _)) = entry {
+                jobs.push((stream, HttpResponse::status(id, 504), false));
             }
         }
         jobs
@@ -341,7 +388,7 @@ mod tests {
             .pending
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(7, (parked, t0));
+            .insert(7, (parked, false, t0));
 
         responder.reap_stale(t0); // fresh — kept
         assert_eq!(
@@ -446,5 +493,109 @@ mod tests {
             "the fast client must be served despite a stalled slow client; got {text:?}"
         );
         assert!(text.ends_with("ok"), "fast client body, got {text:?}");
+    }
+
+    /// Read exactly one HTTP response (status line + headers + Content-Length
+    /// body) off a persistent reader, without consuming the next response.
+    fn read_http_response<R: std::io::BufRead>(r: &mut R) -> String {
+        let mut head = String::new();
+        loop {
+            let mut line = String::new();
+            if r.read_line(&mut line).unwrap() == 0 {
+                break; // EOF
+            }
+            head.push_str(&line);
+            if line == "\r\n" {
+                break; // end of headers
+            }
+        }
+        let len: usize = head
+            .lines()
+            .find_map(|l| {
+                let low = l.to_ascii_lowercase();
+                low.strip_prefix("content-length:")
+                    .and_then(|v| v.trim().parse().ok())
+            })
+            .unwrap_or(0);
+        let mut body = vec![0u8; len];
+        std::io::Read::read_exact(r, &mut body).unwrap();
+        format!("{head}{}", String::from_utf8_lossy(&body))
+    }
+
+    /// TWO requests on ONE connection are both answered without reconnecting —
+    /// HTTP/1.1 keep-alive end to end. The first defaults to keep-alive; the
+    /// second asks to close.
+    #[test]
+    fn one_connection_serves_two_keepalive_requests() {
+        use spiderweb::Bus;
+        use std::io::{BufReader, Write};
+
+        let server = HttpServer::new("ka.req", "ka.resp");
+        let ingress = server.ingress("127.0.0.1:0").expect("bind");
+        let port = ingress.local_addr().port();
+        let responder = server.responder();
+
+        struct Echo;
+        impl Strand for Echo {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn inputs(&self) -> &[Socket] {
+                const S: Socket = Socket::new::<HttpRequest>("ka.req");
+                std::slice::from_ref(&S)
+            }
+            fn outputs(&self) -> &[Socket] {
+                const S: Socket = Socket::new::<HttpResponse>("ka.resp");
+                std::slice::from_ref(&S)
+            }
+            fn run(&mut self, bus: &mut BusHandle) -> Result<(), StrandError> {
+                for r in bus.recv::<HttpRequest>("ka.req").unwrap_or_default() {
+                    let _ = bus.publish_static(
+                        "ka.resp",
+                        HttpResponse::text(r.reply_id, format!("echo:{}", r.path)),
+                    );
+                }
+                bus.sleep(Duration::from_millis(5));
+                Ok(())
+            }
+        }
+
+        let bus_thread = thread::spawn(move || {
+            let mut bus = Bus::open();
+            bus.register(ingress);
+            bus.register(responder);
+            bus.register(Echo);
+            bus.run_until(Some(Duration::from_millis(2500)));
+        });
+        thread::sleep(Duration::from_millis(80));
+
+        let conn = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        conn.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut writer = conn.try_clone().unwrap();
+        let mut reader = BufReader::new(conn);
+
+        // Request 1 — keep-alive (HTTP/1.1 default).
+        writer
+            .write_all(b"GET /one HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap();
+        let r1 = read_http_response(&mut reader);
+        assert!(r1.ends_with("echo:/one"), "first reply: {r1:?}");
+        assert!(
+            r1.contains("Connection: keep-alive"),
+            "first reply should keep the connection open: {r1:?}"
+        );
+
+        // Request 2 on the SAME connection — asks to close.
+        writer
+            .write_all(b"GET /two HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let r2 = read_http_response(&mut reader);
+        assert!(
+            r2.ends_with("echo:/two"),
+            "second reply on same conn: {r2:?}"
+        );
+        assert!(r2.contains("Connection: close"), "second reply: {r2:?}");
+
+        bus_thread.join().unwrap();
     }
 }

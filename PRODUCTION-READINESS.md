@@ -85,7 +85,7 @@ std-only except the SSH lane's `std::process` of `ssh`. Demos `http_api`
 (curl JSON-RPC) + `p2p_mesh`; `webctl lanes`. Workspace green: 156 tests across
 41 binaries, clippy `-D warnings`, fmt. Honest gaps: HTTP/API/mesh/NAT are
 plaintext (use the SSH lane to encrypt); the relay is a SPOF; HTTP is
-`Connection: close` (no keep-alive); no end-to-end ACK beyond the edge ring.
+HTTP/1.1 keep-alive (no pipelining); no end-to-end ACK beyond the edge ring.
 
 ---
 
