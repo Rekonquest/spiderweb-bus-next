@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/spiderweb",
+    "crates/spider",
+    "crates/highway",
+    "crates/preload",
+    "crates/spiderweb-registry",
+    "crates/spiderweb-viz",
+    "crates/spiderweb-edge",
+    "crates/spiderweb-heat",
+    "crates/spiderweb-lanes",
+    "crates/cap-source",
+    "crates/cap-sink",
+    "crates/cap-slow-sink",
+    "crates/cap-crasher",
+    "crates/cap-image",
+    "tools/webctl",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+rust-version = "1.91"
+
+[workspace.dependencies]
+spiderweb = { path = "crates/spiderweb" }
+spider = { path = "crates/spider" }
+highway = { path = "crates/highway" }
+preload = { path = "crates/preload" }
+spiderweb-registry = { path = "crates/spiderweb-registry" }
+spiderweb-viz = { path = "crates/spiderweb-viz" }
+spiderweb-edge = { path = "crates/spiderweb-edge" }
+spiderweb-heat = { path = "crates/spiderweb-heat" }
+spiderweb-lanes = { path = "crates/spiderweb-lanes" }

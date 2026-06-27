@@ -1,0 +1,10 @@
+[package]
+name = "cap-slow-sink"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "A slow subscriber strand. Sleeps on each message. Used to test kernel behavior under congestion."
+
+[dependencies]
+spiderweb = { workspace = true }

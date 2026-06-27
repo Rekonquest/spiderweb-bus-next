@@ -1,0 +1,17 @@
+[package]
+name = "spiderweb-heat"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Graph heat-kernel vibration propagation: H_t = exp(-t*L) over the fabric's
+# strand graph. A swappable GENERATOR for the spider/kernel's attenuation slot
+# — replaces the position-only Euclidean 1/(1+d) with a topology-aware decay
+# that follows the actual edges messages cross. The kernel stays untouched;
+# this is companion math, std-only, zero external dependencies, forbid-unsafe.
+[dependencies]
+spiderweb = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

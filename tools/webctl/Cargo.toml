@@ -1,0 +1,11 @@
+[package]
+name = "webctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "CLI for the spiderweb bus. Lists demos, runs them, and tails their output with formatting."
+
+[[bin]]
+name = "webctl"
+path = "src/main.rs"

@@ -1,0 +1,15 @@
+[package]
+name = "cap-source"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "A trivial publisher strand for the spiderweb prototype."
+
+[dependencies]
+spiderweb = { workspace = true }
+spiderweb-registry = { workspace = true }
+cap-sink = { path = "../cap-sink" }
+cap-slow-sink = { path = "../cap-slow-sink" }
+cap-crasher = { path = "../cap-crasher" }
+spider = { workspace = true }

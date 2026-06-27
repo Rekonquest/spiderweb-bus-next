@@ -1,0 +1,14 @@
+[package]
+name = "spiderweb-registry"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Self-registration for the spiderweb bus: strands advertise themselves; the bus auto-connects them. The kernel stays std-only — this companion crate quarantines the inventory dependency."
+
+[dependencies]
+spiderweb.workspace = true
+inventory = "0.3"
+
+[dev-dependencies]
+spider.workspace = true

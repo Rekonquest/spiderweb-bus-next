@@ -1,0 +1,14 @@
+[package]
+name = "preload"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Layer 2 of the spiderweb bus: read-ahead preloading (the fabric doing work ahead of time)."
+
+[dependencies]
+spiderweb.workspace = true
+
+[dev-dependencies]
+spider.workspace = true
+highway.workspace = true

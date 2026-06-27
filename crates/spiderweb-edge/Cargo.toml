@@ -1,0 +1,18 @@
+[package]
+name = "spiderweb-edge"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Edge transport: cross-process / P2P lanes over a real socket. The KERNEL
+# stays std-only and dependency-free; this companion crate is where the
+# network + serialization live (quarantined exactly like spiderweb-registry
+# quarantines `inventory`). The MVP itself is also std-only, zero external
+# dependencies, and #![forbid(unsafe_code)] — TCP (`std::net`), threads, and
+# mpsc channels are all in `std`.
+[dependencies]
+spiderweb = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

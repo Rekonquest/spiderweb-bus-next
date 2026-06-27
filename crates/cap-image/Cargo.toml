@@ -1,0 +1,15 @@
+[package]
+name = "cap-image"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "A real image-processing strand. Loads a PNG, resizes it, publishes the result. Proves the bus can carry real bytes."
+
+[dependencies]
+spiderweb = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png"] }
+base64 = "0.22"
+
+[dev-dependencies]
+spider = { workspace = true }
