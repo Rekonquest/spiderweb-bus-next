@@ -922,7 +922,13 @@ impl StrandSpec {
 // Envelope + clone registry
 // -----------------------------------------------------------------------------
 
-type Envelope = Box<dyn Any + Send>;
+/// A type-erased, owned message payload (`Box<dyn Any + Send>`). This is the
+/// value the kernel moves through its channels, and the clone (produced by the
+/// shared clone registry, one per subscriber) handed to a named subscriber's
+/// callback.
+pub type Payload = Box<dyn Any + Send>;
+
+type Envelope = Payload;
 
 /// A message on the wire: the socket name, its provenance [`Tag`], and
 /// the type-erased payload. The kernel threads this tuple end-to-end
@@ -1210,6 +1216,18 @@ pub enum BusError {
         socket: &'static str,
         expected: &'static str,
     },
+    /// A subscriber fell behind by this many messages and lost them. This
+    /// mirrors the `Lagged` variant of the broadcast-channel bus this kernel
+    /// is a drop-in for, so downstream `#[from]` conversions keep compiling
+    /// and matching. The current synchronous, inline delivery path never
+    /// produces it — delivery is not queued per subscriber — but the variant is
+    /// part of the stable public contract.
+    Lagged(u64),
+    /// The bus is closed: no live channel. Representable for contract parity;
+    /// in practice an idle bus with zero matching subscribers returns
+    /// `Ok(())` from `publish`, because publishing into an empty web is a
+    /// normal state, not a fault.
+    Closed,
 }
 
 impl fmt::Display for BusError {
@@ -1222,6 +1240,8 @@ impl fmt::Display for BusError {
                     socket, expected
                 )
             }
+            BusError::Lagged(n) => write!(f, "subscription lagged by {} message(s)", n),
+            BusError::Closed => write!(f, "bus channel closed"),
         }
     }
 }
@@ -1231,6 +1251,96 @@ impl std::error::Error for BusError {}
 impl From<BusError> for StrandError {
     fn from(e: BusError) -> Self {
         StrandError::Crashed(e.to_string())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Named (exact/prefix) subscriptions + external publish handle
+// -----------------------------------------------------------------------------
+
+/// How a named subscription matches a published socket name.
+///
+/// TypeId routing (a strand's `inputs()`) is unchanged; this is an ADDITIONAL
+/// routing key, so callers that think in topic strings — Imperium publishes and
+/// subscribes by `net.transport.`-style prefixes — can receive by name too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchKind {
+    /// Deliver only when the published socket name equals the registered name
+    /// exactly. Registering `"net.transport.event"` does NOT receive
+    /// `"net.transport.event.wireguard"`.
+    Exact,
+    /// Deliver when the published socket name starts with the registered
+    /// prefix. Registering `"net.transport.event"` DOES receive
+    /// `"net.transport.event.wireguard"`. The empty prefix (`""`) matches every
+    /// name — the `subscribe_all` case.
+    Prefix,
+}
+
+/// A callback invoked once per message a named subscription matches.
+///
+/// The arguments are the published socket name and ONE owned clone of the
+/// payload (produced by the same clone registry the TypeId fan-out uses). It
+/// runs on the publisher's thread, outside every kernel lock, so a callback may
+/// itself publish without deadlocking. It must not block indefinitely.
+pub type NamedCallback = Box<dyn Fn(&'static str, Payload) + Send + Sync>;
+
+/// A `Send + Sync` handle for publishing onto the bus and registering named
+/// subscriptions from OUTSIDE a strand — an ordinary synchronous function
+/// holding a shared `Arc<BusPublisher>` behind `&self`.
+///
+/// Build it once with [`Bus::publisher`] before the run loop starts; every
+/// clone shares one kernel, so a publisher and the running bus see the same
+/// subscribers. [`BusHandle`] remains the per-tick, `&mut` handle a strand
+/// uses; `BusPublisher` is its external, shareable counterpart.
+///
+/// Publishing is INLINE and synchronous: the payload is fanned out (TypeId
+/// subscribers and named subscribers alike) and the call returns once every
+/// subscriber has been handed a clone. No kernel lock is held across that
+/// fan-out, which is what makes "publish from within a subscriber's own
+/// delivery path" safe.
+pub struct BusPublisher {
+    kernel: Arc<Kernel>,
+}
+
+impl BusPublisher {
+    /// Publish `value` on `socket`. The socket name is the routing key for
+    /// named subscribers; its type is the routing key for TypeId subscribers.
+    ///
+    /// Returns `Ok(())` even with zero matching subscribers — an idle web is
+    /// not an error. See [`BusError`] for the error contract.
+    pub fn publish<T: 'static + Send + Clone>(
+        &self,
+        socket: &'static str,
+        value: T,
+    ) -> Result<(), BusError> {
+        self.kernel
+            .deliver(socket, None, Box::new(value), "<external>");
+        Ok(())
+    }
+
+    /// Subscribe with EXACT-name matching: receive only publishes whose socket
+    /// name is `name` verbatim.
+    pub fn subscribe_exact(&self, name: &'static str, callback: NamedCallback) {
+        self.kernel
+            .subscribe_named(name, MatchKind::Exact, callback);
+    }
+
+    /// Subscribe with PREFIX matching: receive every publish whose socket name
+    /// starts with `prefix`. `subscribe_prefix("", cb)` receives everything.
+    pub fn subscribe_prefix(&self, prefix: &'static str, callback: NamedCallback) {
+        self.kernel
+            .subscribe_named(prefix, MatchKind::Prefix, callback);
+    }
+
+    /// Receive every published socket name (the empty-prefix case).
+    pub fn subscribe_all(&self, callback: NamedCallback) {
+        self.kernel
+            .subscribe_named("", MatchKind::Prefix, callback);
+    }
+
+    /// Subscribe with an explicit [`MatchKind`].
+    pub fn subscribe_match(&self, name: &'static str, kind: MatchKind, callback: NamedCallback) {
+        self.kernel.subscribe_named(name, kind, callback);
     }
 }
 
@@ -1248,6 +1358,30 @@ impl Subscriber {
         match self.sender.send((socket, tag, env)) {
             Ok(()) => Ok(()),
             Err(e) => Err(e.0 .2),
+        }
+    }
+}
+
+/// One named (exact/prefix) subscription. Unlike [`Subscriber`] it holds a
+/// callback rather than a channel: delivery is inline on the publisher's
+/// thread, so a consumer needs neither a strand nor a mailbox to receive, and
+/// may publish from its own delivery path.
+struct NamedSubscriber {
+    /// The registered name (for [`MatchKind::Exact`]) or prefix (for
+    /// [`MatchKind::Prefix`]).
+    key: &'static str,
+    kind: MatchKind,
+    callback: NamedCallback,
+}
+
+impl NamedSubscriber {
+    /// Does a published socket name match this subscription? Prefix matching is
+    /// a plain `starts_with`, so namespaces do not bleed (`"net.a."` never
+    /// matches `"net.b.x"`) and the empty prefix matches everything.
+    fn matches(&self, socket: &str) -> bool {
+        match self.kind {
+            MatchKind::Exact => socket == self.key,
+            MatchKind::Prefix => socket.starts_with(self.key),
         }
     }
 }
@@ -1308,6 +1442,13 @@ struct Kernel {
     subscribers: Mutex<HashMap<TypeId, Vec<Arc<Subscriber>>>>,
     pending: Mutex<HashMap<TypeId, Vec<Carrier>>>,
     slots: Mutex<HashMap<String, Arc<StrandSlot>>>,
+    /// Named (exact/prefix) subscriptions. A LEAF lock: never held while
+    /// holding `subscribers`/`pending`, and never held across payload cloning
+    /// or callback invocation — so a subscriber's callback may publish
+    /// (re-entering `deliver`) without deadlocking. Unlike the TypeId path
+    /// there is NO replay buffer here: a subscriber registered after a publish
+    /// does not receive it.
+    named: Mutex<Vec<Arc<NamedSubscriber>>>,
     /// The emergent fabric: threads and intersections, grown purely
     /// from traffic. Empty at boot. A leaf lock — never held while
     /// holding `subscribers`/`pending`. v1.3.
@@ -1353,6 +1494,7 @@ impl Kernel {
             subscribers: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             slots: Mutex::new(HashMap::new()),
+            named: Mutex::new(Vec::new()),
             fabric: Mutex::new(Fabric::default()),
             control_rx: Mutex::new(Some(control_rx)),
             spider_name: Mutex::new(None),
@@ -1540,7 +1682,7 @@ impl Kernel {
         counter.fetch_add(1, Ordering::Relaxed);
 
         let env: Envelope = Box::new(evt);
-        self.deliver_internal(SYS_LIFECYCLE, env, "kernel");
+        self.deliver_internal(SYS_LIFECYCLE, env, "kernel", true);
     }
 
     /// Build a [`BusStats`] snapshot: lock-free counter reads + one fabric
@@ -1606,7 +1748,38 @@ impl Kernel {
     #[allow(dead_code)] // used by v2 control plane
     fn publish_control(&self, msg: ControlMsg) {
         let env: Envelope = Box::new(msg);
-        self.deliver_internal(SYS_CONTROL, env, "kernel");
+        self.deliver_internal(SYS_CONTROL, env, "kernel", false);
+    }
+
+    /// Register a named (exact/prefix) subscription. It takes effect for
+    /// messages published after this call; messages published earlier are NOT
+    /// replayed (the named path deliberately has no replay buffer, so a late
+    /// subscriber sees only future traffic).
+    fn subscribe_named(&self, key: &'static str, kind: MatchKind, callback: NamedCallback) {
+        self.named
+            .lock_tolerant()
+            .push(Arc::new(NamedSubscriber { key, kind, callback }));
+    }
+
+    /// Snapshot the named subscribers (cheap `Arc` clones) under the leaf lock,
+    /// then release it. Fan-out happens outside every kernel lock.
+    fn named_snapshot(&self) -> Vec<Arc<NamedSubscriber>> {
+        self.named.lock_tolerant().clone()
+    }
+
+    /// Fan a message out to every MATCHING named subscriber: one payload clone
+    /// each (the same clone registry the TypeId path uses), callback invoked on
+    /// the publisher's thread and outside every kernel lock. Zero matches is a
+    /// no-op, never an error.
+    fn deliver_named(&self, socket: &'static str, env: &Envelope) {
+        let subs = self.named_snapshot();
+        if subs.is_empty() {
+            return;
+        }
+        for sub in subs.iter().filter(|s| s.matches(socket)) {
+            let cloned = registry().as_ref().unwrap().clone_env(env);
+            (sub.callback)(socket, cloned);
+        }
     }
 
     fn deliver(&self, socket: &'static str, tag: Tag, env: Envelope, from_name: &str) {
@@ -1746,6 +1919,12 @@ impl Kernel {
             }
         }
 
+        // Named (exact/prefix) fan-out. Independent of the TypeId path and
+        // deliberately NOT buffered: a subscriber that registers later never
+        // sees this message. Delivery runs here, after every kernel lock has
+        // been released, so a callback may itself publish without deadlocking.
+        self.deliver_named(socket, &env);
+
         // Emit lifecycle events after releasing every lock
         // (publish_lifecycle re-locks self.subscribers).
         if was_empty {
@@ -1785,20 +1964,72 @@ impl Kernel {
         }
     }
 
-    fn deliver_internal(&self, socket: &'static str, env: Envelope, from_name: &str) {
+    /// Deliver a kernel-originated message (`sys.lifecycle` or `sys.control`).
+    ///
+    /// `buffer_for_late_subscribers` decides whether this message joins the
+    /// per-type replay buffer so that a consumer subscribing afterwards still
+    /// receives it. It is `true` for lifecycle and `false` for control, and the
+    /// asymmetry is deliberate:
+    ///
+    /// - **Lifecycle events are reports about strands, and losing one is
+    ///   permanent and silent.** A `Crashed` that nobody heard leaves the slot
+    ///   parked waiting for a `ControlMsg` that can never arrive, so the strand
+    ///   is never restarted or quarantined — the supervisor just never learns.
+    ///   Critically, "the supervisor has subscribed" is not an instant this code
+    ///   can observe: the spider subscribes from its own worker's first tick, so
+    ///   a window always exists between a strand starting and the supervisor
+    ///   listening. Buffering closes that window the same way work traffic
+    ///   already does.
+    /// - **Control messages are commands to the kernel**, which subscribes at
+    ///   `Kernel::new` and is therefore never late. Replaying a stale `Restart`
+    ///   or `Quarantine` to a future observer could re-run a control decision
+    ///   against the wrong generation, so they are deliberately NOT buffered.
+    ///
+    /// The append happens under the SAME critical section as the subscriber
+    /// snapshot, in the same lock order `subscribe` uses (subscribers →
+    /// pending). That is what preserves exactly-once delivery: a concurrent
+    /// subscriber either appears in the snapshot below and gets a direct send,
+    /// or replays this message from the buffer when it subscribes — never both,
+    /// never neither.
+    fn deliver_internal(
+        &self,
+        socket: &'static str,
+        env: Envelope,
+        from_name: &str,
+        buffer_for_late_subscribers: bool,
+    ) {
         let type_id = (*env).type_id();
-        let subs = self.subscribers.lock_tolerant();
-        let candidates = match subs.get(&type_id) {
-            Some(c) if !c.is_empty() => c,
-            _ => return,
-        };
-        for sub in candidates.iter() {
-            let cloned = registry().as_ref().unwrap().clone_env(&env);
-            // System messages (lifecycle/control) carry no thread tag.
-            if let Err(returned) = sub.try_send(socket, None, cloned) {
-                let _ = returned;
+        // TypeId fan-out first, all under the subscribers lock...
+        {
+            let subs = self.subscribers.lock_tolerant();
+            if buffer_for_late_subscribers {
+                let mut pending = self.pending.lock_tolerant();
+                let buffered = registry().as_ref().unwrap().clone_env(&env);
+                let buf = pending.entry(type_id).or_default();
+                if buf.len() >= Self::PENDING_BUFFER_CAP {
+                    buf.remove(0);
+                    self.stats.pending_evictions.fetch_add(1, Ordering::Relaxed);
+                }
+                // Kernel-originated messages carry no thread tag and their
+                // socket is reserved, so the buffered tag is always `None` —
+                // matching what a replayed system message must present.
+                buf.push((socket, None, buffered));
+            }
+            if let Some(candidates) = subs.get(&type_id) {
+                for sub in candidates.iter() {
+                    let cloned = registry().as_ref().unwrap().clone_env(&env);
+                    // System messages (lifecycle/control) carry no thread tag.
+                    if let Err(returned) = sub.try_send(socket, None, cloned) {
+                        let _ = returned;
+                    }
+                }
             }
         }
+        // ...then named fan-out with that lock RELEASED, so a named callback
+        // (e.g. a `subscribe_all` observer) may publish from this path without
+        // deadlocking. Reserved sockets (lifecycle/control) route to named
+        // subscribers too, so an all-subscription really sees everything.
+        self.deliver_named(socket, &env);
         let _ = from_name;
     }
 }
@@ -1982,6 +2213,16 @@ impl Bus {
         }
     }
 
+    /// Build a `Send + Sync` [`BusPublisher`] for publishing and named
+    /// subscription from outside a strand. Call it before `run_until` and share
+    /// the result as an `Arc` across threads; the handle shares this bus's
+    /// kernel, so a publisher and the running bus see the same subscribers.
+    pub fn publisher(&self) -> BusPublisher {
+        BusPublisher {
+            kernel: self.kernel.clone(),
+        }
+    }
+
     pub fn register<S: Strand>(&mut self, strand: S) {
         let name = strand.name().to_string();
         self.detect_collision(&name);
@@ -2114,6 +2355,25 @@ impl Bus {
         let kernel = self.kernel.clone();
         let mut specs = std::mem::take(&mut self.specs);
 
+        // NOTE — install order is NOT the fix for the unbuffered-lifecycle
+        // problem, and hoisting the spider here was tried and reverted.
+        //
+        // A lifecycle event reaches only the subscribers registered at the
+        // instant it is published: `publish_lifecycle` goes through
+        // `deliver_internal`, which — unlike the work-traffic path in
+        // `deliver` — does not append to the per-type replay buffer. So a
+        // strand that crashes before the spider has subscribed publishes
+        // `Crashed` to nobody, its slot is parked waiting for a `ControlMsg`
+        // that never arrives, and it is never restarted or quarantined.
+        //
+        // Hoisting the spider's spec to the front of this loop does shrink that
+        // window for the strands installed after it — but it moves the spider's
+        // OWN `Registered` event earlier, ahead of any lifecycle observer that
+        // has not subscribed yet, so those observers miss it. That is a worse
+        // trade: it broke a supervisor test that waits for the spider's
+        // `Registered` before driving stimulus, and it left the underlying race
+        // open anyway. The real fix is to buffer lifecycle events for late
+        // subscribers, the way work traffic already is.
         for spec in specs.drain(..) {
             let name = spec.name;
             let factory = spec.factory;
