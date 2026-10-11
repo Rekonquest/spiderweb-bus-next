@@ -149,5 +149,8 @@ MSRV: Rust **1.91** (const `TypeId` in `Socket::new`).
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your
-option.
+Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE) (`PolyForm-Noncommercial-1.0.0`). Free for personal use, research, education, charities, public-good nonprofits, and government; commercial use is not permitted. This is source-available software, not OSI open source.
+
+Third-party and derived components in this repository keep their original licenses and are **not** covered by the PolyForm license:
+
+- cap-* crates extracted from or modeled on Zed (upstream Apache-2.0 / GPL-3.0 portions keep their original licenses)
